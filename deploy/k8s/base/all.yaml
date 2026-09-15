@@ -102,7 +102,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp05
+          image: order-api:exp06c
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -110,6 +110,11 @@ spec:
             # EXP-05 实验 B：GOMAXPROCS=2 配合 1000m limit（I/O 密集负载 1 核 2 线程）
             - name: GOMAXPROCS
               value: "2"
+            # EXP-06 连接池甜点位（ADR-012）
+            - name: DB_MAX_OPEN_CONNS
+              value: "25"
+            - name: DB_MAX_IDLE_CONNS
+              value: "10"
           ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
           startupProbe:
             httpGet: {path: /readyz, port: 8080}

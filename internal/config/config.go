@@ -3,6 +3,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -13,6 +14,8 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
+	DBMaxOpenConns  int
+	DBMaxIdleConns  int
 }
 
 func Load() Config {
@@ -23,6 +26,8 @@ func Load() Config {
 		ShutdownTimeout: getDur("SHUTDOWN_TIMEOUT", 10*time.Second),
 		ReadTimeout:     getDur("HTTP_READ_TIMEOUT", 5*time.Second),
 		WriteTimeout:    getDur("HTTP_WRITE_TIMEOUT", 10*time.Second),
+		DBMaxOpenConns:  getInt("DB_MAX_OPEN_CONNS", 25),
+		DBMaxIdleConns:  getInt("DB_MAX_IDLE_CONNS", 10),
 	}
 }
 
@@ -37,6 +42,15 @@ func getDur(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func getInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def

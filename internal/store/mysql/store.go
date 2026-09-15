@@ -134,13 +134,14 @@ func (s *Store) GetStock(ctx context.Context, sku string) (int, error) {
 
 // CreatedOrder 下单事务结果。
 type CreatedOrder struct {
-	ID             int64  `json:"id"`
-	UserID         string `json:"user_id"`
-	SKU            string `json:"sku"`
-	Qty            int    `json:"qty"`
-	UnitPriceCents int64  `json:"unit_price_cents"`
-	Status         string `json:"status"`
-	Replayed       bool   `json:"replayed"`
+	ID             int64     `json:"id"`
+	UserID         string    `json:"user_id"`
+	SKU            string    `json:"sku"`
+	Qty            int       `json:"qty"`
+	UnitPriceCents int64     `json:"unit_price_cents"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+	Replayed       bool      `json:"replayed"`
 }
 
 // CreateOrder 在单个事务内完成：幂等占位 → 扣库存 → 建订单。
@@ -260,6 +261,35 @@ func isRetryable(err error) bool {
 	return errors.As(err, &me) && (me.Number == 1213 || me.Number == 1205)
 }
 
+// GetOrdersByCursor 游标分页查询用户订单列表（ADR-011）。
+// 锚点：(created_at, id) 双字段，避免同时间戳下的重复/遗漏。
+// 返回 limit 条，按 created_at DESC, id DESC 排序；hasMore 表示是否还有下一页。
+func (s *Store) GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]CreatedOrder, bool, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	q := s.db.WithContext(ctx).Where("user_id = ?", userID)
+	if beforeCreatedAt != nil && beforeID != nil {
+		q = q.Where(
+			"(created_at < ? OR (created_at = ? AND id < ?))",
+			*beforeCreatedAt, *beforeCreatedAt, *beforeID,
+		)
+	}
+	var rows []OrderModel
+	if err := q.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+		return nil, false, fmt.Errorf("list orders: %w", err)
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	out := make([]CreatedOrder, 0, len(rows))
+	for _, o := range rows {
+		out = append(out, *toCreatedOrder(o, false))
+	}
+	return out, hasMore, nil
+}
+
 // GetLatestOrder 查询用户最新订单（EXP-02 简化版，EXP-06 做索引优化）。
 func (s *Store) GetLatestOrder(ctx context.Context, userID string) (*CreatedOrder, error) {
 	var o OrderModel
@@ -292,6 +322,7 @@ func toCreatedOrder(o OrderModel, replayed bool) *CreatedOrder {
 		Qty:            o.Qty,
 		UnitPriceCents: o.UnitPriceCents,
 		Status:         string(o.Status),
+		CreatedAt:      o.CreatedAt,
 		Replayed:       replayed,
 	}
 }

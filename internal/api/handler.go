@@ -11,6 +11,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -23,6 +24,7 @@ type Store interface {
 	GetStock(ctx context.Context, sku string) (int, error)
 	CreateOrder(ctx context.Context, userID, sku, idemKey, paramHash string) (*mysql.CreatedOrder, error)
 	GetLatestOrder(ctx context.Context, userID string) (*mysql.CreatedOrder, error)
+	GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]mysql.CreatedOrder, bool, error)
 }
 
 type Server struct {
@@ -43,6 +45,7 @@ func (s *Server) Routes() *gin.Engine {
 	r.GET("/api/products/:sku", s.getProduct)
 	r.GET("/api/products/:sku/stock", s.getStock)
 	r.POST("/api/orders", s.createOrder)
+	r.GET("/api/orders", s.listOrders)
 	r.GET("/api/orders/latest", s.getLatestOrder)
 	return r
 }
@@ -116,6 +119,47 @@ func (s *Server) createOrder(c *gin.Context) {
 		RecordOrderCreated()
 	}
 	c.JSON(status, o)
+}
+
+// listOrders 游标分页订单列表（ADR-011）。
+// 查询参数：user_id、limit（默认 10，最大 50）、cursor_created_at、cursor_id。
+// 响应包含 next_cursor_created_at / next_cursor_id / has_more。
+func (s *Server) listOrders(c *gin.Context) {
+	userID := c.Query("user_id")
+	if userID == "" {
+		writeErr(c, http.StatusBadRequest, "bad_request", "user_id query required")
+		return
+	}
+	limit := 10
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 50 {
+			limit = n
+		}
+	}
+	var beforeCreatedAt *time.Time
+	var beforeID *int64
+	if v := c.Query("cursor_created_at"); v != "" {
+		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			beforeCreatedAt = &t
+		}
+	}
+	if v := c.Query("cursor_id"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			beforeID = &n
+		}
+	}
+	orders, hasMore, err := s.store.GetOrdersByCursor(c.Request.Context(), userID, beforeCreatedAt, beforeID, limit)
+	if err != nil {
+		handleStoreErr(c, err)
+		return
+	}
+	resp := gin.H{"orders": orders, "has_more": hasMore}
+	if len(orders) > 0 {
+		last := orders[len(orders)-1]
+		resp["next_cursor_created_at"] = last.CreatedAt.Format(time.RFC3339Nano)
+		resp["next_cursor_id"] = last.ID
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (s *Server) getLatestOrder(c *gin.Context) {

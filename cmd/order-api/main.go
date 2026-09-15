@@ -43,9 +43,11 @@ func main() {
 		log.Error("get sql db", "err", err)
 		os.Exit(1)
 	}
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(10)
+	// 连接池参数由 env 配置（EXP-06 做 A/B 实验，最终值写入连接预算）
+	sqlDB.SetMaxOpenConns(cfg.DBMaxOpenConns)
+	sqlDB.SetMaxIdleConns(cfg.DBMaxIdleConns)
 	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	observability.RegisterDBStats(db)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.PingTimeout)
 	store := mysql.New(db)
