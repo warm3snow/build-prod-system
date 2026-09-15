@@ -1,0 +1,73 @@
+{
+  "uid": "order-api-red",
+  "title": "order-api RED & Business",
+  "tags": ["order-lab", "exp04"],
+  "timezone": "browser",
+  "panels": [
+    {
+      "title": "QPS by route",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{namespace=\"order-lab\"}[1m])) by (route)",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "title": "P99 latency by route",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket{namespace=\"order-lab\"}[1m])))",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "title": "5xx error rate",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{namespace=\"order-lab\",status=~\"5..\"}[1m])) / clamp_min(sum(rate(http_requests_total{namespace=\"order-lab\"}[1m])), 1)",
+          "legendFormat": "5xx rate"
+        }
+      ]
+    },
+    {
+      "title": "Business: orders created / rejected",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(orders_created_total[1m])",
+          "legendFormat": "created/s"
+        },
+        {
+          "expr": "rate(orders_rejected_out_of_stock_total[1m])",
+          "legendFormat": "rejected/s"
+        },
+        {
+          "expr": "rate(orders_replayed_total[1m])",
+          "legendFormat": "replayed/s"
+        }
+      ]
+    },
+    {
+      "title": "Pod CPU throttling",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "sum(rate(container_cpu_cfs_throttled_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])) / clamp_min(sum(rate(container_cpu_usage_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])), 1e-9)",
+          "legendFormat": "throttle ratio"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

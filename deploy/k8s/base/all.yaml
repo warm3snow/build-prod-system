@@ -1,0 +1,195 @@
+# EXP-02 最小部署清单（单文件，便于本地 apply）
+# 结构：Namespace → MySQL(Secret+Deployment+PVC+Service) → order-api(Deployment+Service)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: order-lab
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: order-lab
+type: Opaque
+stringData:
+  # 实验环境内联密钥；生产或多人环境应改用外部 Secret 管理。
+  MYSQL_ROOT_PASSWORD: flash-root
+  MYSQL_DATABASE: flash
+  MYSQL_USER: flash
+  MYSQL_PASSWORD: flash
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+  namespace: order-lab
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+# 建表（GORM AutoMigrate）与种子数据由 order-api 启动时执行（internal/store/mysql），
+# 避免 MySQL 镜像初始化脚本与应用代码两处维护同一份 schema。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mysql}
+  template:
+    metadata:
+      labels: {app: mysql}
+    spec:
+      # mysql:8.0 官方镜像需以 root 启动；安全加固（最小权限/非 root）在 EXP-15 安全发布实验中处理。
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_ROOT_PASSWORD}}
+            - name: MYSQL_DATABASE
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_DATABASE}}
+            - name: MYSQL_USER
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_USER}}
+            - name: MYSQL_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_PASSWORD}}
+          ports: [{containerPort: 3306}]
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h 127.0.0.1 -uflash -pflash"]
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - name: mysql-data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: mysql-data
+          persistentVolumeClaim:
+            claimName: mysql-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: order-lab
+spec:
+  selector: {app: mysql}
+  ports: [{port: 3306, targetPort: 3306}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: order-api}
+  template:
+    metadata:
+      labels: {app: order-api}
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: order-api
+          # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
+          image: order-api:exp05
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            # EXP-05 实验 B：GOMAXPROCS=2 配合 1000m limit（I/O 密集负载 1 核 2 线程）
+            - name: GOMAXPROCS
+              value: "2"
+          ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
+          startupProbe:
+            httpGet: {path: /readyz, port: 8080}
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8080}
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {cpu: 1000m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api
+  namespace: order-lab
+  labels:
+    app: order-api
+spec:
+  selector: {app: order-api}
+  ports:
+    - {port: 8080, targetPort: 8080, name: http}
+    - {port: 2112, targetPort: 2112, name: metrics}
+---
+# ServiceMonitor：由 monitoring 命名空间的 Prometheus Operator 发现（release 标签匹配）。
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-api
+  namespace: order-lab
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels: {app: order-api}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+---
+# 告警规则：用户症状（错误率/延迟）＋容量（Pod CPU 节流）。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: order-api-alerts
+  namespace: order-lab
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: order-api.rules
+      rules:
+        - alert: OrderAPIErrorRateHigh
+          expr: |
+            sum(rate(http_requests_total{route=~"/api/.*",status=~"5.."}[5m]))
+              / clamp_min(sum(rate(http_requests_total{route=~"/api/.*"}[5m])), 1) > 0.01
+          for: 2m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api 5xx 错误率超过 1%"
+        - alert: OrderAPIP99High
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (rate(http_request_duration_seconds_bucket{route=~"/api/.*"}[5m]))
+            ) > 0.5
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api P99 延迟超过 500ms"
+        - alert: OrderAPICPUThrottling
+          expr: |
+            sum(rate(container_cpu_cfs_throttled_seconds_total{namespace="order-lab",container="order-api"}[5m]))
+              / clamp_min(sum(rate(container_cpu_usage_seconds_total{namespace="order-lab",container="order-api"}[5m])), 1e-9) > 0.1
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api CPU 节流比例超过 10%"

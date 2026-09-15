@@ -1,0 +1,27 @@
+# 二进制与构建产物
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# 本地环境
+.env
+.env.*
+!.env.example
+
+# 依赖与工具缓存
+/vendor/
+.tools/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# 压测与故障演练产物
+/tests/load/results/
+/tests/chaos/results/
