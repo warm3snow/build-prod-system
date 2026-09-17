@@ -66,6 +66,74 @@
           "legendFormat": "throttle ratio"
         }
       ]
+    },
+    {
+      "title": "Cache hit ratio by op (EXP-07)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "targets": [
+        {
+          "expr": "sum(rate(cache_hits_total{namespace=\"order-lab\"}[1m])) / clamp_min(sum(rate(cache_hits_total{namespace=\"order-lab\"}[1m])) + sum(rate(cache_misses_total{namespace=\"order-lab\"}[1m])), 1e-9)",
+          "legendFormat": "overall"
+        },
+        {
+          "expr": "sum by (op) (rate(cache_hits_total{namespace=\"order-lab\"}[1m])) / clamp_min(sum by (op) (rate(cache_hits_total{namespace=\"order-lab\"}[1m])) + sum by (op) (rate(cache_misses_total{namespace=\"order-lab\"}[1m])), 1e-9)",
+          "legendFormat": "{{op}}"
+        }
+      ]
+    },
+    {
+      "title": "Cache ops & errors (EXP-07)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(cache_hits_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "hits {{op}}"
+        },
+        {
+          "expr": "sum by (op) (rate(cache_misses_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "misses {{op}}"
+        },
+        {
+          "expr": "sum by (op) (rate(cache_negative_hits_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "neg {{op}}"
+        },
+        {
+          "expr": "sum by (op) (rate(cache_errors_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "errors {{op}}"
+        }
+      ]
+    },
+    {
+      "title": "Cache invalidations (EXP-07)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(cache_invalidate_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "title": "DB reads: product/stock backfill source (EXP-07)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{namespace=\"order-lab\",route=~\"/api/products/.*\",status=\"200\"}[1m]))",
+          "legendFormat": "product 2xx"
+        },
+        {
+          "expr": "sum(rate(cache_misses_total{namespace=\"order-lab\",op=\"product\"}[1m]))",
+          "legendFormat": "product backfill (miss)"
+        },
+        {
+          "expr": "sum(rate(cache_misses_total{namespace=\"order-lab\",op=\"stock\"}[1m]))",
+          "legendFormat": "stock backfill (miss)"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,

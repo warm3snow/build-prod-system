@@ -106,6 +106,10 @@ profile 会显示：热点不在业务代码，而在网络 syscall 与调度（
 ## 18. Interview Questions
 
 - CPU profile 52% 在 syscall 说明什么？这时候该改代码还是加资源？
+  → I/O 密集画像、无业务热点可优化，该调资源配置而非改代码（实测零代码改动 +64% 吞吐）。
 - 为什么 GOMAXPROCS=1 延迟爆炸而 GOMAXPROCS=6 节流？
+  → =6 时按 VM 核数并发但 cgroup 只有 0.5 核配额 → 节流+futex 开销；=1 时单线程排队 → 延迟雪崩（p95 3.17s）；2 对齐 1000m 才平衡。
 - k6 dropped_iterations 是什么？为什么它比 QPS 先暴露问题？
+  → VU 池耗尽被丢弃的迭代；服务饱和时先 dropped 后报错，只看送达 QPS 会误判容量。
 - 如何判断一个“慢”是代码热点、锁竞争还是资源限制？
+  → profile 业务函数占比高=代码热点，syscall/futex 多=资源限制，锁函数高=锁竞争；再用单变量对照确认归因。

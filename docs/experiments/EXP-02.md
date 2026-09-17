@@ -106,6 +106,10 @@ order-api × 1  ──── mysql × 1 (local-path PVC 2Gi)
 ## 18. Interview Questions
 
 - readiness 和 liveness 的区别？为什么 DB 故障时 readiness 失败但 liveness 不重启？
+  → readiness 失败摘流不重启（依赖未就绪），liveness 失败才重启（进程死锁）；DB 故障时进程本身健康，重启风暴无益反而加重故障。
 - 为什么 graceful shutdown 需要 terminationGracePeriodSeconds？
+  → 它是优雅退出的预算上限：SIGTERM 后等在途请求完成，超时未退出才 SIGKILL，防止请求被硬中断。
 - 为什么建表语句要逐条执行？
+  → 驱动默认不支持 multiStatements（实测 1064）；逐条执行能精确定位失败语句，且避免开启多语句带来的注入面。
 - PVC 在 Pod 删除后还存在吗？数据什么时候会丢？
+  → 存在：PVC 是独立资源，删 Pod 重建后数据仍在（实测 stock 999）；丢数据的是删 PVC/删 Namespace/底层存储故障。

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/warm3snow/build-prod-system/internal/cache"
 	"github.com/warm3snow/build-prod-system/internal/store/mysql"
 )
 
@@ -27,13 +28,15 @@ type Store interface {
 	GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]mysql.CreatedOrder, bool, error)
 }
 
+// Server HTTP 处理层。cch 为 nil 或缓存禁用时走纯 MySQL 路径（EXP-07 无缓存对照组）。
 type Server struct {
 	store Store
+	cch   *cache.Client
 	log   *slog.Logger
 }
 
-func NewServer(store Store, log *slog.Logger) *Server {
-	return &Server{store: store, log: log}
+func NewServer(store Store, cch *cache.Client, log *slog.Logger) *Server {
+	return &Server{store: store, cch: cch, log: log}
 }
 
 // Routes 返回带日志与指标中间件的 Gin 路由。
@@ -64,22 +67,61 @@ func (s *Server) readyz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
+// getProduct Cache Aside 读路径：缓存命中直接返回；未命中回源 DB 后回填。
+// 响应头 X-Cache 标记本次读取的缓存状态（hit/neg/miss/off），供压测与手册观察。
+// 负缓存命中（此前确认不存在）直接返回 404，不打 DB。
 func (s *Server) getProduct(c *gin.Context) {
 	sku := c.Param("sku")
+	if s.cch != nil {
+		if p, st := s.cch.GetProduct(c.Request.Context(), sku); st != cache.HitMiss {
+			c.Header("X-Cache", st.String())
+			if st == cache.HitNegative {
+				handleStoreErr(c, mysql.ErrNotFound)
+				return
+			}
+			c.JSON(http.StatusOK, p)
+			return
+		}
+	}
 	p, err := s.store.GetProduct(c.Request.Context(), sku)
 	if err != nil {
+		if s.cch != nil && errors.Is(err, mysql.ErrNotFound) {
+			// 回源确认不存在：标注 miss（本次确实回源了），再写短期负缓存防穿透。
+			c.Header("X-Cache", cache.HitMiss.String())
+			s.cch.SetProductMissing(c.Request.Context(), sku)
+		}
 		handleStoreErr(c, err)
 		return
+	}
+	if s.cch != nil {
+		s.cch.SetProduct(c.Request.Context(), sku, p)
+		c.Header("X-Cache", cache.HitMiss.String())
+	} else {
+		c.Header("X-Cache", "off")
 	}
 	c.JSON(http.StatusOK, p)
 }
 
+// getStock 展示库存查询，允许缓存有限陈旧（下单仍以 MySQL 事务为准）。
 func (s *Server) getStock(c *gin.Context) {
 	sku := c.Param("sku")
+	if s.cch != nil {
+		if stock, st := s.cch.GetStock(c.Request.Context(), sku); st != cache.HitMiss {
+			c.Header("X-Cache", st.String())
+			c.JSON(http.StatusOK, gin.H{"sku": sku, "stock": stock})
+			return
+		}
+	}
 	stock, err := s.store.GetStock(c.Request.Context(), sku)
 	if err != nil {
 		handleStoreErr(c, err)
 		return
+	}
+	if s.cch != nil {
+		s.cch.SetStock(c.Request.Context(), sku, stock)
+		c.Header("X-Cache", cache.HitMiss.String())
+	} else {
+		c.Header("X-Cache", "off")
 	}
 	c.JSON(http.StatusOK, gin.H{"sku": sku, "stock": stock})
 }
@@ -110,6 +152,11 @@ func (s *Server) createOrder(c *gin.Context) {
 	if err != nil {
 		handleStoreErr(c, err)
 		return
+	}
+	// Cache Aside：MySQL 事务已提交，此刻才失效缓存；重放订单不改变库存，无需失效。
+	// 失效失败由 cache 层兜底（EXPIRE 1s → 主 TTL），不影响下单响应。
+	if !o.Replayed && s.cch != nil {
+		s.cch.Invalidate(c.Request.Context(), req.SKU)
 	}
 	status := http.StatusCreated
 	if o.Replayed {

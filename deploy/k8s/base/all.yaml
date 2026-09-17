@@ -85,6 +85,57 @@ spec:
   selector: {app: mysql}
   ports: [{port: 3306, targetPort: 3306}]
 ---
+# EXP-07：Redis 查询缓存（Cache Aside）。单实例、内存有界（allkeys-lru），
+# 纯缓存可重建，不挂 PVC；Redis 不可用时应用降级为无缓存模式。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis}
+  template:
+    metadata:
+      labels: {app: redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args:
+            - "--maxmemory"
+            - "64mb"
+            - "--maxmemory-policy"
+            - "allkeys-lru"
+            - "--save"
+            - ""
+          ports: [{containerPort: 6379}]
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: order-lab
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -102,7 +153,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp06c
+          image: order-api:exp07c
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -115,6 +166,17 @@ spec:
               value: "25"
             - name: DB_MAX_IDLE_CONNS
               value: "10"
+            # EXP-07 缓存（Cache Aside）：Redis 不可用时降级为无缓存
+            - name: REDIS_ADDR
+              value: "redis.order-lab.svc.cluster.local:6379"
+            - name: REDIS_TIMEOUT
+              value: "100ms"
+            - name: CACHE_ENABLED
+              value: "true"
+            - name: CACHE_TTL
+              value: "60s"
+            - name: NEG_CACHE_TTL
+              value: "5s"
           ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
           startupProbe:
             httpGet: {path: /readyz, port: 8080}

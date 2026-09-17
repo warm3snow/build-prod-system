@@ -16,6 +16,18 @@ type Config struct {
 	WriteTimeout    time.Duration
 	DBMaxOpenConns  int
 	DBMaxIdleConns  int
+
+	// Redis 缓存（EXP-07）。Redis 是可选依赖：连接失败时降级为无缓存模式。
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+	RedisTimeout  time.Duration
+	CacheEnabled  bool
+	CacheTTL      time.Duration
+	NegCacheTTL   time.Duration
+	// 实验开关（EXP-07 陈旧窗口测量用，生产配置必须为 0）：
+	InvalidateDelay time.Duration // 下单提交后延迟 DEL，放大"提交→失效"窗口
+	FillDelay       time.Duration // 回源后延迟 SET，放大"旧值回填"竞态窗口
 }
 
 func Load() Config {
@@ -28,7 +40,26 @@ func Load() Config {
 		WriteTimeout:    getDur("HTTP_WRITE_TIMEOUT", 10*time.Second),
 		DBMaxOpenConns:  getInt("DB_MAX_OPEN_CONNS", 25),
 		DBMaxIdleConns:  getInt("DB_MAX_IDLE_CONNS", 10),
+
+		RedisAddr:       getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:   getEnv("REDIS_PASSWORD", ""),
+		RedisDB:         getInt("REDIS_DB", 0),
+		RedisTimeout:    getDur("REDIS_TIMEOUT", 100*time.Millisecond),
+		CacheEnabled:    getBool("CACHE_ENABLED", false),
+		CacheTTL:        getDur("CACHE_TTL", 60*time.Second),
+		NegCacheTTL:     getDur("NEG_CACHE_TTL", 5*time.Second),
+		InvalidateDelay: time.Duration(getInt("CACHE_INVALIDATE_DELAY_MS", 0)) * time.Millisecond,
+		FillDelay:       time.Duration(getInt("CACHE_FILL_DELAY_MS", 0)) * time.Millisecond,
 	}
+}
+
+func getBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
 }
 
 func getEnv(key, def string) string {

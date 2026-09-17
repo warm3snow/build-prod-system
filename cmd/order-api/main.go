@@ -13,11 +13,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/logging"
 	gormmysql "gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
 	"github.com/warm3snow/build-prod-system/internal/api"
+	"github.com/warm3snow/build-prod-system/internal/cache"
 	"github.com/warm3snow/build-prod-system/internal/config"
 	"github.com/warm3snow/build-prod-system/internal/observability"
 	"github.com/warm3snow/build-prod-system/internal/store/mysql"
@@ -61,9 +64,40 @@ func main() {
 	}
 	cancel()
 
+	// 缓存（EXP-07）：Redis 是可选依赖，启动 Ping 失败不阻塞服务，也不永久放弃缓存——
+	// 客户端保留（go-redis 连接池按需重连），失败期间读请求带超时降级回源，
+	// Redis 就绪后自动恢复命中。连接池有界（PoolSize 20），为 EXP-08 预留资源预算。
+	var cch *cache.Client
+	if cfg.CacheEnabled {
+		// 抑制 go-redis 内部连接池错误日志：Redis 不可用期间每次请求都会产生
+		// "failed to dial" 输出淹没业务日志；失败已通过 cache_errors_total 指标观测。
+		redis.SetLogger(&logging.VoidLogger{})
+		rdb := redis.NewClient(&redis.Options{
+			Addr:         cfg.RedisAddr,
+			Password:     cfg.RedisPassword,
+			DB:           cfg.RedisDB,
+			DialTimeout:  cfg.RedisTimeout,
+			ReadTimeout:  cfg.RedisTimeout,
+			WriteTimeout: cfg.RedisTimeout,
+			PoolSize:     20,
+			MinIdleConns: 5,
+			MaxRetries:   1, // 不可用期间快速失败回源，不放大请求耗时
+		})
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), cfg.RedisTimeout)
+		err := rdb.Ping(pingCtx).Err()
+		pingCancel()
+		if err != nil {
+			// 典型场景：order-api 与 Redis 同时启动，Redis 尚未通过 readiness。
+			// 保留客户端，请求侧按未命中降级，Redis 就绪后自动恢复。
+			log.Warn("redis not ready at startup, cache reads degrade to miss", "err", err)
+		}
+		cch = cache.New(rdb, cfg.CacheTTL, cfg.NegCacheTTL, cfg.RedisTimeout, cfg.FillDelay, cfg.InvalidateDelay)
+		log.Info("cache enabled", "addr", cfg.RedisAddr, "ttl", cfg.CacheTTL, "neg_ttl", cfg.NegCacheTTL)
+	}
+
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      api.NewServer(store, log).Routes(),
+		Handler:      api.NewServer(store, cch, log).Routes(),
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 	}

@@ -107,7 +107,12 @@ RED 指标（按 route 分类）＋业务订单指标，配合阶梯到达率压
 ## 18. Interview Questions
 
 - 为什么压测用到达率模型而不是固定 VU？
+  → 固定 VU 下服务变慢会降低实际施压（coordinated omission），测不到真实容量；到达率模型保持固定速率，真实暴露容量边界。
 - dropped_iterations 是什么？为什么它是容量判断的先行指标？
+  → VU 池耗尽时被丢弃的迭代；服务饱和时它先于错误率上升（实测送达 1219 req/s、dropped 704/s、错误率 0%）。
 - CPU 节流（throttled_seconds）如何反映 limit 设置问题？
+  → usage 顶到 limit 且 throttled 持续增长 = limit 是硬顶，瓶颈是资源限制而非代码慢。
 - 为什么 metrics 要独立端口？
+  → 抓取请求会污染业务 RED 指标的分母（拉低错误率），独立端口还利于故障隔离与 pprof 访问控制。
 - 如何证明“1000 QPS 达标”而不只报一个平均延迟？
+  → 到达率闭环（送达+dropped）+ 分位延迟（读 16.4ms/写 39.5ms）+ 错误分类 + 资源余量（CPU 188m/500m）组合证据，而非一个均值。
