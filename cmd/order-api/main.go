@@ -79,7 +79,7 @@ func main() {
 			DialTimeout:  cfg.RedisTimeout,
 			ReadTimeout:  cfg.RedisTimeout,
 			WriteTimeout: cfg.RedisTimeout,
-			PoolSize:     20,
+			PoolSize:     cfg.RedisPoolSize,
 			MinIdleConns: 5,
 			MaxRetries:   1, // 不可用期间快速失败回源，不放大请求耗时
 		})
@@ -91,8 +91,21 @@ func main() {
 			// 保留客户端，请求侧按未命中降级，Redis 就绪后自动恢复。
 			log.Warn("redis not ready at startup, cache reads degrade to miss", "err", err)
 		}
-		cch = cache.New(rdb, cfg.CacheTTL, cfg.NegCacheTTL, cfg.RedisTimeout, cfg.FillDelay, cfg.InvalidateDelay)
-		log.Info("cache enabled", "addr", cfg.RedisAddr, "ttl", cfg.CacheTTL, "neg_ttl", cfg.NegCacheTTL)
+		cch = cache.New(cache.Config{
+			RDB: rdb, TTL: cfg.CacheTTL, NegTTL: cfg.NegCacheTTL, OpTimeout: cfg.RedisTimeout,
+			FillDelay: cfg.FillDelay, InvalidateDelay: cfg.InvalidateDelay,
+			CoalesceEnabled:   cfg.CoalesceEnabled,
+			BackfillMaxConcur: cfg.BackfillMaxConcur,
+			BackfillAcquireTO: cfg.BackfillAcquireTO,
+			BackfillTimeout:   cfg.BackfillTimeout,
+			StaleMaxEntries:   cfg.StaleMaxEntries,
+			StaleTTL:          cfg.StaleTTL,
+			InvalidateQueueSize: cfg.InvalidateQueueSize,
+		})
+		defer cch.Close()
+		log.Info("cache enabled", "addr", cfg.RedisAddr, "ttl", cfg.CacheTTL, "neg_ttl", cfg.NegCacheTTL,
+			"pool_size", cfg.RedisPoolSize, "coalesce", cfg.CoalesceEnabled,
+			"backfill_max_concur", cfg.BackfillMaxConcur, "backfill_timeout", cfg.BackfillTimeout)
 	}
 
 	srv := &http.Server{

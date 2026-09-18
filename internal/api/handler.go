@@ -67,38 +67,32 @@ func (s *Server) readyz(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ready"})
 }
 
-// getProduct Cache Aside 读路径：缓存命中直接返回；未命中回源 DB 后回填。
-// 响应头 X-Cache 标记本次读取的缓存状态（hit/neg/miss/off），供压测与手册观察。
-// 负缓存命中（此前确认不存在）直接返回 404，不打 DB。
+// getProduct Cache Aside 读路径（EXP-08 起带请求合并与有界回源）：
+// 命中/负命中直接返回；miss 时在 cache 层的合并+并发+超时保护下回源；
+// 回源受限时对允许陈旧的商品查询返回本地旧值（stale），无旧值明确拒绝（503）。
+// 响应头 X-Cache 标记本次读取状态（hit/neg/miss/stale/reject/off）。
 func (s *Server) getProduct(c *gin.Context) {
 	sku := c.Param("sku")
 	if s.cch != nil {
-		if p, st := s.cch.GetProduct(c.Request.Context(), sku); st != cache.HitMiss {
-			c.Header("X-Cache", st.String())
-			if st == cache.HitNegative {
-				handleStoreErr(c, mysql.ErrNotFound)
-				return
-			}
+		p, st, code := s.cch.GetOrLoadProduct(c.Request.Context(), sku,
+			func(ctx context.Context) (mysql.Product, error) { return s.store.GetProduct(ctx, sku) })
+		c.Header("X-Cache", st.String())
+		switch st {
+		case cache.StatusHit, cache.StatusFresh, cache.StatusStale:
 			c.JSON(http.StatusOK, p)
-			return
+		case cache.StatusNeg, cache.StatusNegFresh:
+			writeErr(c, http.StatusNotFound, "not_found", "resource not found")
+		default: // StatusRejected：回源受限且无旧值，明确拒绝而非伪装成功
+			writeErr(c, http.StatusServiceUnavailable, string(code), "cache backfill degraded")
 		}
+		return
 	}
 	p, err := s.store.GetProduct(c.Request.Context(), sku)
 	if err != nil {
-		if s.cch != nil && errors.Is(err, mysql.ErrNotFound) {
-			// 回源确认不存在：标注 miss（本次确实回源了），再写短期负缓存防穿透。
-			c.Header("X-Cache", cache.HitMiss.String())
-			s.cch.SetProductMissing(c.Request.Context(), sku)
-		}
 		handleStoreErr(c, err)
 		return
 	}
-	if s.cch != nil {
-		s.cch.SetProduct(c.Request.Context(), sku, p)
-		c.Header("X-Cache", cache.HitMiss.String())
-	} else {
-		c.Header("X-Cache", "off")
-	}
+	c.Header("X-Cache", "off")
 	c.JSON(http.StatusOK, p)
 }
 
@@ -106,23 +100,25 @@ func (s *Server) getProduct(c *gin.Context) {
 func (s *Server) getStock(c *gin.Context) {
 	sku := c.Param("sku")
 	if s.cch != nil {
-		if stock, st := s.cch.GetStock(c.Request.Context(), sku); st != cache.HitMiss {
-			c.Header("X-Cache", st.String())
+		stock, st, code := s.cch.GetOrLoadStock(c.Request.Context(), sku,
+			func(ctx context.Context) (int, error) { return s.store.GetStock(ctx, sku) })
+		c.Header("X-Cache", st.String())
+		switch st {
+		case cache.StatusHit, cache.StatusFresh, cache.StatusStale:
 			c.JSON(http.StatusOK, gin.H{"sku": sku, "stock": stock})
-			return
+		case cache.StatusNeg, cache.StatusNegFresh:
+			writeErr(c, http.StatusNotFound, "not_found", "resource not found")
+		default: // StatusRejected
+			writeErr(c, http.StatusServiceUnavailable, string(code), "cache backfill degraded")
 		}
+		return
 	}
 	stock, err := s.store.GetStock(c.Request.Context(), sku)
 	if err != nil {
 		handleStoreErr(c, err)
 		return
 	}
-	if s.cch != nil {
-		s.cch.SetStock(c.Request.Context(), sku, stock)
-		c.Header("X-Cache", cache.HitMiss.String())
-	} else {
-		c.Header("X-Cache", "off")
-	}
+	c.Header("X-Cache", "off")
 	c.JSON(http.StatusOK, gin.H{"sku": sku, "stock": stock})
 }
 

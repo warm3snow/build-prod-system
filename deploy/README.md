@@ -48,3 +48,20 @@ kubectl delete namespace order-lab   # 注意：PVC 删除后数据丢失
 - [x] 相同 Idempotency-Key 返回同一订单（replayed=true）
 - [x] 同键不同参数返回 409 idempotency_conflict
 - [x] 优雅退出（15s terminationGracePeriod）
+
+## 6. Grafana 面板部署（EXP-08 起）
+
+面板唯一源文件是 `deploy/monitoring/grafana-dashboard-order-api.json`
+（uid `order-api-red`，EXP-07/08 面板均在其中）。通过 Grafana sidecar 自动加载，
+修改 JSON 后执行：
+
+```bash
+kubectl create configmap order-api-dashboard -n monitoring \
+  --from-file=grafana-dashboard-order-api.json=deploy/monitoring/grafana-dashboard-order-api.json \
+  --dry-run=client -o yaml | \
+  python3 -c 'import sys,yaml; d=yaml.safe_load(sys.stdin); d["metadata"]["labels"]={"grafana_dashboard":"1"}; print(yaml.safe_dump(d))' | \
+  kubectl apply -f -
+```
+
+sidecar 检测到 ConfigMap 变更后自动 reload（约 1 分钟内生效）。面板 uid 保持不变，
+手动 import 的历史版本会被同一 uid 覆盖，不会产生重复面板。

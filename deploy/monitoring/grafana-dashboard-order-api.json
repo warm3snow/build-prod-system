@@ -1,13 +1,21 @@
 {
   "uid": "order-api-red",
   "title": "order-api RED & Business",
-  "tags": ["order-lab", "exp04"],
+  "tags": [
+    "order-lab",
+    "exp04"
+  ],
   "timezone": "browser",
   "panels": [
     {
       "title": "QPS by route",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{namespace=\"order-lab\"}[1m])) by (route)",
@@ -18,7 +26,12 @@
     {
       "title": "P99 latency by route",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
       "targets": [
         {
           "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket{namespace=\"order-lab\"}[1m])))",
@@ -29,7 +42,12 @@
     {
       "title": "5xx error rate",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{namespace=\"order-lab\",status=~\"5..\"}[1m])) / clamp_min(sum(rate(http_requests_total{namespace=\"order-lab\"}[1m])), 1)",
@@ -40,7 +58,12 @@
     {
       "title": "Business: orders created / rejected",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
       "targets": [
         {
           "expr": "rate(orders_created_total[1m])",
@@ -59,7 +82,12 @@
     {
       "title": "Pod CPU throttling",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16},
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
       "targets": [
         {
           "expr": "sum(rate(container_cpu_cfs_throttled_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])) / clamp_min(sum(rate(container_cpu_usage_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])), 1e-9)",
@@ -70,7 +98,12 @@
     {
       "title": "Cache hit ratio by op (EXP-07)",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "sum(rate(cache_hits_total{namespace=\"order-lab\"}[1m])) / clamp_min(sum(rate(cache_hits_total{namespace=\"order-lab\"}[1m])) + sum(rate(cache_misses_total{namespace=\"order-lab\"}[1m])), 1e-9)",
@@ -85,7 +118,12 @@
     {
       "title": "Cache ops & errors (EXP-07)",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
       "targets": [
         {
           "expr": "sum by (op) (rate(cache_hits_total{namespace=\"order-lab\"}[1m]))",
@@ -108,7 +146,12 @@
     {
       "title": "Cache invalidations (EXP-07)",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
       "targets": [
         {
           "expr": "sum by (result) (rate(cache_invalidate_total{namespace=\"order-lab\"}[1m]))",
@@ -119,7 +162,12 @@
     {
       "title": "DB reads: product/stock backfill source (EXP-07)",
       "type": "timeseries",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
       "targets": [
         {
           "expr": "sum(rate(http_requests_total{namespace=\"order-lab\",route=~\"/api/products/.*\",status=\"200\"}[1m]))",
@@ -134,8 +182,86 @@
           "legendFormat": "stock backfill (miss)"
         }
       ]
+    },
+    {
+      "title": "Backfill wanted vs executed (EXP-08)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "expr": "sum by (op) (rate(cache_backfill_wanted_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "wanted {{op}}"
+        },
+        {
+          "expr": "sum by (op) (rate(cache_backfill_executed_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "executed {{op}}"
+        }
+      ]
+    },
+    {
+      "title": "Backfill outcome stacked (EXP-08)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(cache_backfill_outcome_total{namespace=\"order-lab\"}[1m]))",
+          "legendFormat": "{{result}}"
+        }
+      ]
+    },
+    {
+      "title": "Invalidate queue len (EXP-08)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "cache_invalidate_queue_len{namespace=\"order-lab\"}",
+          "legendFormat": "queue len"
+        }
+      ]
+    },
+    {
+      "title": "Stale entries (EXP-08)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "cache_stale_entries{namespace=\"order-lab\"}",
+          "legendFormat": "entries"
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
-  "version": 1
+  "version": 2
 }

@@ -153,7 +153,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp07c
+          image: order-api:exp08e
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -171,12 +171,30 @@ spec:
               value: "redis.order-lab.svc.cluster.local:6379"
             - name: REDIS_TIMEOUT
               value: "100ms"
+            # EXP-08 实测：4000 QPS 下 PoolSize 20 被耗尽（GET 错误率 12.7%），
+            # 触发 stale 降级；池大小保持有界，扩容到 128 消除人为瓶颈（见报告场景 A 初测）。
+            - name: REDIS_POOL_SIZE
+              value: "128"
             - name: CACHE_ENABLED
               value: "true"
             - name: CACHE_TTL
               value: "60s"
             - name: NEG_CACHE_TTL
               value: "5s"
+            # EXP-08 有界回源：请求合并、回源并发/等待/超时上限、旧值降级。
+            # 回源并发 12 < DB 连接池 25，为下单写路径保留预算（EXP-06 连接预算表）。
+            - name: CACHE_COALESCE_ENABLED
+              value: "true"
+            - name: BACKFILL_MAX_CONCURRENCY
+              value: "12"
+            - name: BACKFILL_ACQUIRE_TIMEOUT
+              value: "200ms"
+            - name: BACKFILL_TIMEOUT
+              value: "1s"
+            - name: STALE_MAX_ENTRIES
+              value: "1024"
+            - name: STALE_TTL
+              value: "60s"
           ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
           startupProbe:
             httpGet: {path: /readyz, port: 8080}

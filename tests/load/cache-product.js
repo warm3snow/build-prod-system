@@ -22,6 +22,8 @@ const cacheHit = new Counter('cache_hits');
 const cacheNeg = new Counter('cache_neg');
 const cacheMiss = new Counter('cache_misses');
 const cacheOff = new Counter('cache_off');
+const cacheStale = new Counter('cache_stale');
+const cacheReject = new Counter('cache_reject');
 
 export const options = {
   scenarios: {
@@ -73,6 +75,12 @@ function countCache(res) {
       break;
     case 'off':
       cacheOff.add(1);
+      break;
+    case 'stale':
+      cacheStale.add(1);
+      break;
+    case 'reject':
+      cacheReject.add(1);
       break;
     default:
       cacheMiss.add(1);

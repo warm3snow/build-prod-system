@@ -8,7 +8,7 @@ const BASE_URL = __ENV.BASE_URL || 'http://order-api.order-lab.svc.cluster.local
 const SKU_COUNT = parseInt(__ENV.SKU_COUNT || '100', 10);
 
 export const options = {
-  vus: 10,
+  vus: Math.min(10, Math.max(1, SKU_COUNT * 2)),
   iterations: SKU_COUNT * 2,
 };
 
