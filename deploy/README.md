@@ -6,18 +6,28 @@
 ## 1. 构建镜像（每次代码变更换新 tag）
 
 ```bash
-docker build -t order-api:exp02-v3 .
+docker build -t order-api:exp09a .
 # 同步修改 deploy/k8s/base/all.yaml 中 order-api 的 image tag，再 apply
 ```
 
 注意：同 tag 重建镜像会被 kubelet 复用旧镜像，本地迭代必须换 tag。
+
+EXP-09 起共三个 Go 镜像：`order-api`、`outbox-relay`、`consumer`（同一代码仓库，
+不同 `cmd/` 入口）。网络受限时按 `docs/experiments/EXP-09-manual.md` 第 1 节的
+「底座 + docker cp 注入 + commit」方式离线构建。
 
 ## 2. 部署
 
 ```bash
 kubectl apply -f deploy/k8s/base/all.yaml
 kubectl -n order-lab get pods -w
+# 预期 Pod：mysql、redis、kafka（KRaft 单节点，首次启动较慢）、
+# order-api、outbox-relay、consumer
 ```
+
+EXP-09 新增组件：Kafka（`apache/kafka:3.9.0`，KRaft 单节点，PVC `kafka-data` 2Gi）、
+`outbox-relay`（Outbox→Kafka 投递）、`consumer`（Inbox 去重 + 后置通知副作用）。
+Kafka 单实例不提供高可用（EXP-17 验证）。
 
 ## 3. 本地访问
 
@@ -65,3 +75,9 @@ kubectl create configmap order-api-dashboard -n monitoring \
 
 sidecar 检测到 ConfigMap 变更后自动 reload（约 1 分钟内生效）。面板 uid 保持不变，
 手动 import 的历史版本会被同一 uid 覆盖，不会产生重复面板。
+
+注意：kube-prometheus-stack 的 kubelet ServiceMonitor 默认 metricRelabelings 会
+drop `container_cpu_cfs_throttled_seconds_total`（cgroup v2 兼容性），且本环境
+kubelet `/metrics/cadvisor` 序列不带 `container` 标签。节流率请用
+`container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total`
+比值，并以 `pod=~"order-api-.*"` 过滤（面板与 PrometheusRule 已按此修正）。

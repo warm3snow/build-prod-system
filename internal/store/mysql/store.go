@@ -9,6 +9,7 @@ import (
 	"time"
 
 	sqldriver "github.com/go-sql-driver/mysql"
+	"github.com/warm3snow/build-prod-system/internal/event"
 	"github.com/warm3snow/build-prod-system/internal/order"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -76,6 +77,7 @@ func New(db *gorm.DB) *Store {
 func (s *Store) InitSchema(ctx context.Context) error {
 	if err := s.db.WithContext(ctx).AutoMigrate(
 		&Product{}, &Inventory{}, &OrderModel{}, &Idempotency{},
+		&OutboxEvent{}, &InboxEvent{}, &OrderNotification{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -144,11 +146,13 @@ type CreatedOrder struct {
 	Replayed       bool      `json:"replayed"`
 }
 
-// CreateOrder 在单个事务内完成：幂等占位 → 扣库存 → 建订单。
+// CreateOrder 在单个事务内完成：幂等占位 → 扣库存 → 建订单 → 写 Outbox 事件。
 // 采用 insert-first 幂等：先 INSERT (user_id, idem_key) 占位，
 // 同键并发由唯一键（复合主键）串行化，避免 SELECT ... FOR UPDATE 在空记录上的 gap lock 死锁。
 // 死锁（1213）与锁等待（1205）通过有限重试自动恢复。
-func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, paramHash string) (*CreatedOrder, error) {
+// EXP-09：新订单在事务内写入 Outbox（事件 ID 唯一），重放订单不产生新事件；
+// trace 携带关联上下文（request_id/trace_parent），贯穿 Relayer 与 Consumer。
+func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, paramHash string, trace event.TraceContext) (*CreatedOrder, error) {
 	var out *CreatedOrder
 	err := withTxRetry(ctx, s.db, func(tx *gorm.DB) error {
 		// 1. 幂等占位（含参数哈希）：同键第二次插入触发 1062，判定重放或冲突。
@@ -176,28 +180,18 @@ func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, pa
 			return nil
 		}
 
-		// 2. 条件更新扣库存：stock > 0 才允许扣减，避免超卖。
-		res := tx.Model(&Inventory{}).
-			Where("sku = ? AND stock > 0", sku).
-			UpdateColumn("stock", gorm.Expr("stock - 1"))
-		if res.Error != nil {
-			return fmt.Errorf("deduct stock: %w", res.Error)
-		}
-		if res.RowsAffected == 0 {
-			return ErrOutOfStock
-		}
-
-		// 3. 锁定商品行取价。
+		// 2. 读取商品价格：业务模型中价格不可变（无改价接口，EXP-01 冻结），
+		// 普通读即可，无需 FOR UPDATE 占用 P1 商品行热点锁（EXP-09 实测该锁
+		// 在 200 TPS 单 SKU 热点下放大排队）。
 		var p Product
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("sku = ?", sku).First(&p).Error; err != nil {
+		if err := tx.Where("sku = ?", sku).First(&p).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotFound
 			}
 			return fmt.Errorf("get price: %w", err)
 		}
 
-		// 4. 建订单，并回填幂等记录的 order_id（同一事务）。
+		// 3. 建订单，并回填幂等记录的 order_id（同一事务）。
 		o := OrderModel{
 			UserID:         userID,
 			Sku:            sku,
@@ -212,6 +206,35 @@ func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, pa
 			Where("user_id = ? AND idem_key = ?", userID, idemKey).
 			Update("order_id", o.ID).Error; err != nil {
 			return fmt.Errorf("backfill idempotency: %w", err)
+		}
+
+		// 4. Outbox 事件：与订单同事务提交（EXP-09）。
+		// 事件 ID 在事务内生成，是 Kafka 消息 key 与 Inbox 去重键。
+		if err := writeOutbox(tx, o.ID, event.OrderCreated{
+			EventID:     event.NewID(),
+			OrderID:     o.ID,
+			UserID:      userID,
+			SKU:         sku,
+			RequestID:   trace.RequestID,
+			TraceParent: trace.TraceParent,
+			CreatedAt:   o.CreatedAt,
+		}); err != nil {
+			return err
+		}
+
+		// 5. 条件更新扣库存：放在事务最后，stock > 0 才允许扣减，避免超卖。
+		// EXP-09 把热点行锁（inventory）的持有窗口压缩到「1 条 UPDATE + COMMIT」：
+		// 此前顺序（库存第 2 步）在 200 TPS 单 SKU 热点下与 outbox INSERT 叠加，
+		// 锁队列爆炸（实测下单 P50 5.7s、连接池等待 22 万次）。
+		// 锁顺序保持全局一致（idempotency → … → inventory），无死锁序反转。
+		res := tx.Model(&Inventory{}).
+			Where("sku = ? AND stock > 0", sku).
+			UpdateColumn("stock", gorm.Expr("stock - 1"))
+		if res.Error != nil {
+			return fmt.Errorf("deduct stock: %w", res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return ErrOutOfStock
 		}
 		out = toCreatedOrder(o, false)
 		return nil

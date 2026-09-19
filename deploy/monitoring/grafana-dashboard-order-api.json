@@ -90,7 +90,7 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(container_cpu_cfs_throttled_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])) / clamp_min(sum(rate(container_cpu_usage_seconds_total{namespace=\"order-lab\",container=\"order-api\"}[1m])), 1e-9)",
+          "expr": "sum(rate(container_cpu_cfs_throttled_periods_total{namespace=\"order-lab\",pod=~\"order-api-.*\"}[1m])) / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace=\"order-lab\",pod=~\"order-api-.*\"}[1m])), 1e-9)",
           "legendFormat": "throttle ratio"
         }
       ]

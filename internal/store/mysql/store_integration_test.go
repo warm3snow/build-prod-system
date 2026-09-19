@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/warm3snow/build-prod-system/internal/event"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -90,7 +91,7 @@ func TestConcurrentNoOversell(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			userID := fmt.Sprintf("%s-%d", userPrefix, i%20)
-			_, err := store.CreateOrder(ctx, userID, sku, fmt.Sprintf("key-%d", i), hashFor(userID, sku))
+			_, err := store.CreateOrder(ctx, userID, sku, fmt.Sprintf("key-%d", i), hashFor(userID, sku), event.TraceContext{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -152,7 +153,7 @@ func TestConcurrentIdempotencyHeavy(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			o, err := store.CreateOrder(ctx, userID, sku, "heavy-same-key", hashFor(userID, sku))
+			o, err := store.CreateOrder(ctx, userID, sku, "heavy-same-key", hashFor(userID, sku), event.TraceContext{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -205,7 +206,7 @@ func TestConcurrentIdempotency(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			o, err := store.CreateOrder(ctx, userID, sku, "same-key", hashFor(userID, sku))
+			o, err := store.CreateOrder(ctx, userID, sku, "same-key", hashFor(userID, sku), event.TraceContext{})
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
@@ -249,10 +250,10 @@ func TestIdempotencyConflict(t *testing.T) {
 	resetSku(t, db, sku, 10, userID)
 
 	ctx := context.Background()
-	if _, err := store.CreateOrder(ctx, userID, sku, "conf-key", hashFor(userID, sku)); err != nil {
+	if _, err := store.CreateOrder(ctx, userID, sku, "conf-key", hashFor(userID, sku), event.TraceContext{}); err != nil {
 		t.Fatalf("first order: %v", err)
 	}
-	_, err := store.CreateOrder(ctx, userID, "P2", "conf-key", hashFor(userID, "P2"))
+	_, err := store.CreateOrder(ctx, userID, "P2", "conf-key", hashFor(userID, "P2"), event.TraceContext{})
 	if err != ErrIdempotencyConf {
 		t.Fatalf("expected ErrIdempotencyConf, got %v", err)
 	}
@@ -275,7 +276,7 @@ func TestOutOfStockRollback(t *testing.T) {
 	userID := uniquePrefix("exp03-oos")
 	resetSku(t, db, sku, 0, userID)
 
-	_, err := store.CreateOrder(context.Background(), userID, sku, "oos-key", hashFor(userID, sku))
+	_, err := store.CreateOrder(context.Background(), userID, sku, "oos-key", hashFor(userID, sku), event.TraceContext{})
 	if err != ErrOutOfStock {
 		t.Fatalf("expected ErrOutOfStock, got %v", err)
 	}

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/warm3snow/build-prod-system/internal/cache"
+	"github.com/warm3snow/build-prod-system/internal/event"
 	"github.com/warm3snow/build-prod-system/internal/store/mysql"
 )
 
@@ -23,10 +24,13 @@ type Store interface {
 	Ping(ctx context.Context) error
 	GetProduct(ctx context.Context, sku string) (mysql.Product, error)
 	GetStock(ctx context.Context, sku string) (int, error)
-	CreateOrder(ctx context.Context, userID, sku, idemKey, paramHash string) (*mysql.CreatedOrder, error)
+	CreateOrder(ctx context.Context, userID, sku, idemKey, paramHash string, trace event.TraceContext) (*mysql.CreatedOrder, error)
 	GetLatestOrder(ctx context.Context, userID string) (*mysql.CreatedOrder, error)
 	GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]mysql.CreatedOrder, bool, error)
 }
+
+// traceContextKey gin context 键：请求关联上下文（request_id / traceparent）。
+const traceContextKey = "exp09.trace"
 
 // Server HTTP 处理层。cch 为 nil 或缓存禁用时走纯 MySQL 路径（EXP-07 无缓存对照组）。
 type Server struct {
@@ -144,7 +148,10 @@ func (s *Server) createOrder(c *gin.Context) {
 		return
 	}
 	paramHash := hashParams(req.UserID, req.SKU, req.Qty)
-	o, err := s.store.CreateOrder(c.Request.Context(), req.UserID, req.SKU, key, paramHash)
+	// 关联上下文：request_id（中间件生成）+ traceparent（W3C，预留 OTel），
+	// 随事件贯穿 Outbox → Kafka → Consumer，实现 HTTP/Relay/Consumer 全链路关联。
+	trace := traceFromContext(c)
+	o, err := s.store.CreateOrder(c.Request.Context(), req.UserID, req.SKU, key, paramHash, trace)
 	if err != nil {
 		handleStoreErr(c, err)
 		return
@@ -253,6 +260,8 @@ func writeErr(c *gin.Context, status int, code, msg string) {
 }
 
 // withLogging 结构化请求日志：method、path、status、耗时、请求 ID（EXP-04 扩展指标）。
+// EXP-09：把关联上下文（request_id/traceparent）放入 gin context，
+// 供下单路径写入 Outbox 事件，贯穿全链路。
 func withLogging(log *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
@@ -260,6 +269,10 @@ func withLogging(log *slog.Logger) gin.HandlerFunc {
 		if rid == "" {
 			rid = "rid-" + hex.EncodeToString(randBytes(8))
 		}
+		c.Set(traceContextKey, event.TraceContext{
+			RequestID:   rid,
+			TraceParent: c.GetHeader("traceparent"),
+		})
 		c.Next()
 		log.Info("http_request",
 			"method", c.Request.Method,
@@ -269,6 +282,16 @@ func withLogging(log *slog.Logger) gin.HandlerFunc {
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	}
+}
+
+// traceFromContext 读取请求关联上下文；缺失时降级为空（事件仍写入，仅少关联信息）。
+func traceFromContext(c *gin.Context) event.TraceContext {
+	if v, ok := c.Get(traceContextKey); ok {
+		if t, ok := v.(event.TraceContext); ok {
+			return t
+		}
+	}
+	return event.TraceContext{}
 }
 
 // randBytes 生成随机字节；失败时降级为时间戳派生，保证日志中间件不 panic。

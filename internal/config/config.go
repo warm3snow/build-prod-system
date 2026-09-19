@@ -31,13 +31,32 @@ type Config struct {
 	FillDelay       time.Duration // 回源后延迟 SET，放大"旧值回填"竞态窗口
 
 	// 有界回源（EXP-08）：热点过期合并、回源并发/超时上限、超限降级（旧值/拒绝）。
-	CoalesceEnabled      bool          // 进程内请求合并（singleflight），对照实验可关闭
-	BackfillMaxConcur    int           // 回源并发上限，必须在 DB 连接预算内
-	BackfillAcquireTO    time.Duration // 等待回源额度的最长时间（有界等待）
-	BackfillTimeout      time.Duration // 单次回源的独立超时
-	StaleMaxEntries      int           // 本地旧值库最大条目数
-	StaleTTL             time.Duration // 本地旧值可服务时长
-	InvalidateQueueSize  int           // 异步失效队列容量；满则丢弃（陈旧由 TTL 兜底）
+	CoalesceEnabled     bool          // 进程内请求合并（singleflight），对照实验可关闭
+	BackfillMaxConcur   int           // 回源并发上限，必须在 DB 连接预算内
+	BackfillAcquireTO   time.Duration // 等待回源额度的最长时间（有界等待）
+	BackfillTimeout     time.Duration // 单次回源的独立超时
+	StaleMaxEntries     int           // 本地旧值库最大条目数
+	StaleTTL            time.Duration // 本地旧值可服务时长
+	InvalidateQueueSize int           // 异步失效队列容量；满则丢弃（陈旧由 TTL 兜底）
+
+	// 可靠事件（EXP-09）：Outbox → Kafka → Inbox 去重 → 后置副作用。
+	KafkaBrokers  string // 逗号分隔的 Kafka broker 列表
+	KafkaTopic    string // 订单事件主题（单分区，保序主线）
+	ConsumerGroup string // 消费组 ID
+
+	// outbox-relay
+	RelayBatchSize      int           // 每轮投递批次大小
+	RelayPollInterval   time.Duration // 轮询间隔（也决定投递延迟下界）
+	OutboxMaxAttempts   int           // 最大投递尝试次数，超过标记 DEAD
+	RelayMetricsAddr    string        // Relay metrics 监听地址
+	RelayDBMaxOpenConns int           // Relay 独立连接池上限（EXP-06 预算预留）
+	RelayDBMaxIdleConns int
+
+	// consumer
+	ConsumerRetryBackoff   time.Duration // 处理失败（DB 不可用）重试间隔
+	ConsumerMetricsAddr    string        // Consumer metrics 监听地址
+	ConsumerDBMaxOpenConns int           // Consumer 独立连接池上限（EXP-06 预算预留）
+	ConsumerDBMaxIdleConns int
 }
 
 func Load() Config {
@@ -62,13 +81,29 @@ func Load() Config {
 		InvalidateDelay: time.Duration(getInt("CACHE_INVALIDATE_DELAY_MS", 0)) * time.Millisecond,
 		FillDelay:       time.Duration(getInt("CACHE_FILL_DELAY_MS", 0)) * time.Millisecond,
 
-		CoalesceEnabled:      getBool("CACHE_COALESCE_ENABLED", true),
-		BackfillMaxConcur:    getInt("BACKFILL_MAX_CONCURRENCY", 12),
-		BackfillAcquireTO:    getDur("BACKFILL_ACQUIRE_TIMEOUT", 200*time.Millisecond),
-		BackfillTimeout:      getDur("BACKFILL_TIMEOUT", time.Second),
-		StaleMaxEntries:      getInt("STALE_MAX_ENTRIES", 1024),
-		StaleTTL:             getDur("STALE_TTL", 60*time.Second),
-		InvalidateQueueSize:  getInt("INVALIDATE_QUEUE_SIZE", 1024),
+		CoalesceEnabled:     getBool("CACHE_COALESCE_ENABLED", true),
+		BackfillMaxConcur:   getInt("BACKFILL_MAX_CONCURRENCY", 12),
+		BackfillAcquireTO:   getDur("BACKFILL_ACQUIRE_TIMEOUT", 200*time.Millisecond),
+		BackfillTimeout:     getDur("BACKFILL_TIMEOUT", time.Second),
+		StaleMaxEntries:     getInt("STALE_MAX_ENTRIES", 1024),
+		StaleTTL:            getDur("STALE_TTL", 60*time.Second),
+		InvalidateQueueSize: getInt("INVALIDATE_QUEUE_SIZE", 1024),
+
+		KafkaBrokers:  getEnv("KAFKA_BROKERS", "kafka.order-lab.svc.cluster.local:9092"),
+		KafkaTopic:    getEnv("KAFKA_TOPIC", "orders"),
+		ConsumerGroup: getEnv("CONSUMER_GROUP", "order-consumer"),
+
+		RelayBatchSize:      getInt("RELAY_BATCH_SIZE", 100),
+		RelayPollInterval:   getDur("RELAY_POLL_INTERVAL", 500*time.Millisecond),
+		OutboxMaxAttempts:   getInt("OUTBOX_MAX_ATTEMPTS", 100),
+		RelayMetricsAddr:    getEnv("RELAY_METRICS_ADDR", ":2113"),
+		RelayDBMaxOpenConns: getInt("RELAY_DB_MAX_OPEN_CONNS", 4),
+		RelayDBMaxIdleConns: getInt("RELAY_DB_MAX_IDLE_CONNS", 2),
+
+		ConsumerRetryBackoff:   getDur("CONSUMER_RETRY_BACKOFF", time.Second),
+		ConsumerMetricsAddr:    getEnv("CONSUMER_METRICS_ADDR", ":2114"),
+		ConsumerDBMaxOpenConns: getInt("CONSUMER_DB_MAX_OPEN_CONNS", 4),
+		ConsumerDBMaxIdleConns: getInt("CONSUMER_DB_MAX_IDLE_CONNS", 2),
 	}
 }
 

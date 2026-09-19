@@ -67,7 +67,10 @@ spec:
             timeoutSeconds: 3
           resources:
             requests: {cpu: 250m, memory: 512Mi}
-            limits: {cpu: "1", memory: 1Gi}
+            # EXP-09 重估：事件链路（Outbox 同事务 + Relay 轮询/标记 + Consumer 消费）
+            # 使 1 核 limit 在 2000 QPS 混合负载下 CPU 饱和（实测 1.0 核打满，
+            # 引发连接池排队与 readyz 超时）。提至 2 核，预算重估见 EXP-09 报告。
+            limits: {cpu: "2", memory: 1Gi}
           volumeMounts:
             - name: mysql-data
               mountPath: /var/lib/mysql
@@ -136,6 +139,121 @@ spec:
   selector: {app: redis}
   ports: [{port: 6379, targetPort: 6379}]
 ---
+# EXP-09：Kafka 单实例（KRaft，无 ZooKeeper）。单 Broker 故障保障边界见 EXP-09 报告；
+# 本实验不声称 Kafka 高可用（EXP-17 才验证）。日志目录挂 PVC，Broker 重启不丢消息。
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-data
+  namespace: order-lab
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-hs
+  namespace: order-lab
+spec:
+  clusterIP: None
+  selector: {app: kafka}
+  ports: [{port: 9093, targetPort: 9093, name: controller}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: order-lab
+spec:
+  serviceName: kafka-hs
+  replicas: 1
+  selector:
+    matchLabels: {app: kafka}
+  template:
+    metadata:
+      labels: {app: kafka}
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          env:
+            # KRaft 单节点：同一进程承担 broker+controller。
+            # controller.quorum.voters 用 headless DNS（kafka-0.kafka-hs），重启后可重连。
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://:9092,CONTROLLER://:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka.order-lab.svc.cluster.local:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-0.kafka-hs.order-lab.svc.cluster.local:9093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            # 固定 cluster.id（22 字符 base64）：首次启动自动 format，重启保持同一集群
+            - name: KAFKA_CLUSTER_ID
+              value: "AAAAAAAAAAAAAAAAAAAAAA"
+            # 单机实验档控制内存占用（默认 -Xmx1G 会压爆 Rancher Desktop）。
+            # EXP-09 实测：512m 堆 + 1Gi limit 被 OOM kill（Exit 137）3 次，
+            # 未 flush 日志丢失。堆提至 768m、limit 提至 2Gi。
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx768m -Xms384m"
+          ports:
+            - {containerPort: 9092, name: client}
+            - {containerPort: 9093, name: controller}
+          readinessProbe:
+            exec:
+              command:
+                - /opt/kafka/bin/kafka-broker-api-versions.sh
+                - --bootstrap-server=localhost:9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /opt/kafka/bin/kafka-broker-api-versions.sh
+                - --bootstrap-server=localhost:9092
+            periodSeconds: 30
+            timeoutSeconds: 5
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            # EXP-09 实测 1Gi 下 OOM kill（Exit 137）导致未 flush 日志丢失
+            limits: {cpu: "1", memory: 2Gi}
+          volumeMounts:
+            - name: kafka-data
+              # apache/kafka:3.9.0 的 KRaft 默认日志目录是 /tmp/kafka-logs
+              #（EXP-09 曾误挂 /tmp/kraft-combined-logs，数据落在容器层随 Pod 销毁丢失）
+              mountPath: /tmp/kafka-logs
+      volumes:
+        - name: kafka-data
+          persistentVolumeClaim:
+            claimName: kafka-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: order-lab
+spec:
+  selector: {app: kafka}
+  ports: [{port: 9092, targetPort: 9092, name: client}]
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -153,7 +271,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp08e
+          image: order-api:exp09a
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -210,7 +328,10 @@ spec:
             timeoutSeconds: 2
           resources:
             requests: {cpu: 100m, memory: 64Mi}
-            limits: {cpu: 1000m, memory: 256Mi}
+            # EXP-09 重估：下单路径新增 Outbox 固定开销（uuid+序列化+INSERT）后，
+            # 2000 QPS 混合负载下 1 核 limit 打满（实测 0.999 核，引发全链路排队）。
+            # 提至 2 核；GOMAXPROCS=2 保持（EXP-05 冻结），预算重估见 EXP-09 报告。
+            limits: {cpu: "2", memory: 256Mi}
 ---
 apiVersion: v1
 kind: Service
@@ -225,6 +346,115 @@ spec:
     - {port: 8080, targetPort: 8080, name: http}
     - {port: 2112, targetPort: 2112, name: metrics}
 ---
+# EXP-09：outbox-relay（Outbox → Kafka）。单副本；Kafka 不可用时事件保持 PENDING 积压，
+# 下单不受影响（Outbox 与订单同事务提交），Kafka 恢复后自动排空。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-relay
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: outbox-relay}
+  template:
+    metadata:
+      labels: {app: outbox-relay}
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: outbox-relay
+          image: outbox-relay:exp09a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            - name: RELAY_DB_MAX_OPEN_CONNS
+              value: "4"
+            - name: RELAY_DB_MAX_IDLE_CONNS
+              value: "2"
+            - name: KAFKA_BROKERS
+              value: "kafka.order-lab.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "orders"
+            # EXP-09 实测：batch 100 + 500ms 轮询 = 200 msg/s 上限，与 200 TPS 下单
+            # 恰好平衡，队列堆积致投递延迟持续增长；提至 500（1000 msg/s，5 倍余量）。
+            - name: RELAY_BATCH_SIZE
+              value: "500"
+            - name: RELAY_POLL_INTERVAL
+              value: "500ms"
+            - name: OUTBOX_MAX_ATTEMPTS
+              value: "100"
+            - name: RELAY_METRICS_ADDR
+              value: ":2113"
+          ports: [{containerPort: 2113, name: metrics}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: outbox-relay
+  namespace: order-lab
+  labels:
+    app: outbox-relay
+spec:
+  selector: {app: outbox-relay}
+  ports:
+    - {port: 2113, targetPort: 2113, name: metrics}
+---
+# EXP-09：consumer（Kafka → Inbox 去重 → 后置副作用）。单副本保序处理。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: consumer}
+  template:
+    metadata:
+      labels: {app: consumer}
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: consumer
+          image: consumer:exp09a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            - name: CONSUMER_DB_MAX_OPEN_CONNS
+              value: "4"
+            - name: CONSUMER_DB_MAX_IDLE_CONNS
+              value: "2"
+            - name: KAFKA_BROKERS
+              value: "kafka.order-lab.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "orders"
+            - name: CONSUMER_GROUP
+              value: "order-consumer"
+            - name: CONSUMER_METRICS_ADDR
+              value: ":2114"
+          ports: [{containerPort: 2114, name: metrics}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: consumer
+  namespace: order-lab
+  labels:
+    app: consumer
+spec:
+  selector: {app: consumer}
+  ports:
+    - {port: 2114, targetPort: 2114, name: metrics}
+---
 # ServiceMonitor：由 monitoring 命名空间的 Prometheus Operator 发现（release 标签匹配）。
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -236,6 +466,36 @@ metadata:
 spec:
   selector:
     matchLabels: {app: order-api}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: outbox-relay
+  namespace: order-lab
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels: {app: outbox-relay}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: consumer
+  namespace: order-lab
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels: {app: consumer}
   endpoints:
     - port: metrics
       path: /metrics
@@ -272,9 +532,30 @@ spec:
             summary: "order-api P99 延迟超过 500ms"
         - alert: OrderAPICPUThrottling
           expr: |
-            sum(rate(container_cpu_cfs_throttled_seconds_total{namespace="order-lab",container="order-api"}[5m]))
-              / clamp_min(sum(rate(container_cpu_usage_seconds_total{namespace="order-lab",container="order-api"}[5m])), 1e-9) > 0.1
+            sum(rate(container_cpu_cfs_throttled_periods_total{namespace="order-lab",pod=~"order-api-.*"}[5m]))
+              / clamp_min(sum(rate(container_cpu_cfs_periods_total{namespace="order-lab",pod=~"order-api-.*"}[5m])), 1e-9) > 0.1
           for: 5m
           labels: {severity: warning}
           annotations:
             summary: "order-api CPU 节流比例超过 10%"
+        # EXP-09：事件链路告警——未投递事件保留并告警；Relay 停滞且有积压即告警。
+        - alert: OutboxBacklogHigh
+          expr: outbox_backlog > 10000
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Outbox 积压超过 10000 条，事件投递可能停滞"
+        - alert: OutboxRelayNotDelivering
+          expr: |
+            outbox_backlog > 0
+              and sum(rate(relay_sent_total[5m])) == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "Outbox 有积压但 Relay 5 分钟内无成功投递"
+        - alert: OutboxDeadEvents
+          expr: increase(relay_dead_total[10m]) > 0
+          for: 1m
+          labels: {severity: warning}
+          annotations:
+            summary: "出现 DEAD 事件（超过最大尝试次数，需显式重放）"
