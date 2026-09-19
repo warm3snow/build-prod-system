@@ -45,6 +45,12 @@ var (
 			Help: "幂等重放返回既有订单的次数。",
 		},
 	)
+	ordersRejectedBacklog = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "orders_rejected_backlog_total",
+			Help: "因事件积压超过预算水位被拒绝的下单次数（EXP-10 反压）。",
+		},
+	)
 )
 
 // MetricsMiddleware 记录 RED 指标。放在路由匹配之后，确保 route 已归一化。
@@ -69,3 +75,6 @@ func RecordOrderRejected() { ordersRejectedOutOfStock.Inc() }
 
 // RecordOrderReplayed 幂等重放时调用。
 func RecordOrderReplayed() { ordersReplayedTotal.Inc() }
+
+// RecordOrderRejectedBacklog 积压反压拒绝时调用。
+func RecordOrderRejectedBacklog() { ordersRejectedBacklog.Inc() }

@@ -208,6 +208,16 @@ spec:
             # 固定 cluster.id（22 字符 base64）：首次启动自动 format，重启保持同一集群
             - name: KAFKA_CLUSTER_ID
               value: "AAAAAAAAAAAAAAAAAAAAAA"
+            # EXP-10 磁盘/保留期预算：24h 或 1.5GiB（低于 PVC 2Gi），先到先删最老段。
+            # 与 Outbox 积压高水位共同构成「积压不能无限增长」的双重预算。
+            - name: KAFKA_LOG_RETENTION_HOURS
+              value: "24"
+            - name: KAFKA_LOG_RETENTION_BYTES
+              value: "1610612736"
+            # 禁止自动建主题：主题必须由 relay 按 KAFKA_PARTITIONS 显式创建
+            #（否则 consumer 先连时 broker 按默认 1 分区自动创建，EXP-10 实测踩坑）
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
             # 单机实验档控制内存占用（默认 -Xmx1G 会压爆 Rancher Desktop）。
             # EXP-09 实测：512m 堆 + 1Gi limit 被 OOM kill（Exit 137）3 次，
             # 未 flush 日志丢失。堆提至 768m、limit 提至 2Gi。
@@ -224,13 +234,17 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
+          # liveness 只判「进程是否存活」，不能在高负载下误杀：EXP-10 实测回放
+          # 12 万事件时 broker-api-versions 响应 >5s，kubelet SIGTERM（Exit 143）
+          # 反复重启。放宽超时与失败阈值（存活判定交给更宽松的口径）。
           livenessProbe:
             exec:
               command:
                 - /opt/kafka/bin/kafka-broker-api-versions.sh
                 - --bootstrap-server=localhost:9092
-            periodSeconds: 30
-            timeoutSeconds: 5
+            periodSeconds: 60
+            timeoutSeconds: 15
+            failureThreshold: 3
           resources:
             requests: {cpu: 250m, memory: 512Mi}
             # EXP-09 实测 1Gi 下 OOM kill（Exit 137）导致未 flush 日志丢失
@@ -271,7 +285,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp09a
+          image: order-api:exp10a
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -313,6 +327,9 @@ spec:
               value: "1024"
             - name: STALE_TTL
               value: "60s"
+            # EXP-10 积压反压：PENDING 超过水位时下单被明确拒绝（503 backlog_limited）
+            - name: OUTBOX_BACKLOG_LIMIT
+              value: "200000"
           ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
           startupProbe:
             httpGet: {path: /readyz, port: 8080}
@@ -364,7 +381,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: outbox-relay
-          image: outbox-relay:exp09a
+          image: outbox-relay:exp10a
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -377,12 +394,15 @@ spec:
               value: "kafka.order-lab.svc.cluster.local:9092"
             - name: KAFKA_TOPIC
               value: "orders"
+            # EXP-10：3 分区（固定），分区 key=event_id hash
+            - name: KAFKA_PARTITIONS
+              value: "3"
             # EXP-09 实测：batch 100 + 500ms 轮询 = 200 msg/s 上限，与 200 TPS 下单
-            # 恰好平衡，队列堆积致投递延迟持续增长；提至 500（1000 msg/s，5 倍余量）。
+            # 恰好平衡，队列堆积致投递延迟持续增长；batch 200 + 200ms = 1000 msg/s。
             - name: RELAY_BATCH_SIZE
-              value: "500"
+              value: "200"
             - name: RELAY_POLL_INTERVAL
-              value: "500ms"
+              value: "200ms"
             - name: OUTBOX_MAX_ATTEMPTS
               value: "100"
             - name: RELAY_METRICS_ADDR
@@ -421,15 +441,15 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: consumer
-          image: consumer:exp09a
+          image: consumer:exp10a
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
               value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
             - name: CONSUMER_DB_MAX_OPEN_CONNS
-              value: "4"
+              value: "16"
             - name: CONSUMER_DB_MAX_IDLE_CONNS
-              value: "2"
+              value: "8"
             - name: KAFKA_BROKERS
               value: "kafka.order-lab.svc.cluster.local:9092"
             - name: KAFKA_TOPIC
@@ -438,6 +458,16 @@ spec:
               value: "order-consumer"
             - name: CONSUMER_METRICS_ADDR
               value: ":2114"
+            # EXP-10 并发消费：8 worker + 16 在途上限（有界队列 = 反压）
+            - name: CONSUMER_CONCURRENCY
+              value: "8"
+            - name: CONSUMER_MAX_INFLIGHT
+              value: "16"
+            # 攒批：一批事件一个事务（1 次 fsync），突破逐条事务 ~250/s 的串行墙
+            - name: CONSUMER_BATCH_SIZE
+              value: "50"
+            - name: CONSUMER_BATCH_WAIT
+              value: "10ms"
           ports: [{containerPort: 2114, name: metrics}]
           resources:
             requests: {cpu: 50m, memory: 64Mi}
@@ -559,3 +589,20 @@ spec:
           labels: {severity: warning}
           annotations:
             summary: "出现 DEAD 事件（超过最大尝试次数，需显式重放）"
+        # EXP-10：Kafka 磁盘预算（PVC 2Gi 的 80%）与消费停滞告警
+        - alert: KafkaDiskUsageHigh
+          expr: |
+            kubelet_volume_stats_used_bytes{namespace="order-lab",persistentvolumeclaim="kafka-data"}
+              / kubelet_volume_stats_capacity_bytes{namespace="order-lab",persistentvolumeclaim="kafka-data"} > 0.8
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "Kafka 数据卷用量超过 80%（保留期预算 1.5GiB 可能先触发删段）"
+        - alert: ConsumerStalledWithBacklog
+          expr: |
+            outbox_backlog > 1000
+              and sum(rate(consumer_processed_total[5m])) == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "事件有积压但 consumer 5 分钟内零处理（消费停滞）"

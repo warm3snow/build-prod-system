@@ -29,9 +29,14 @@ type Producer struct {
 	w *kafka.Writer
 }
 
-// NewProducer 创建生产者并确保主题存在（幂等创建，1 分区 1 副本）。
+// NewProducer 创建生产者并确保主题存在（幂等创建）。
+// EXP-10：分区数由调用方传入（KAFKA_PARTITIONS）；已存在主题分区数不足时
+// 返回错误（分区只增不减，实验对照用不同主题名或手动 alter，见 EXP-10-manual）。
 // 实验为单 Broker，Kafka 未就绪时创建失败会返回错误（启动重试由调用方负责）。
-func NewProducer(brokers []string, topic string) (*Producer, error) {
+func NewProducer(brokers []string, topic string, partitions int) (*Producer, error) {
+	if partitions <= 0 {
+		partitions = 1
+	}
 	w := &kafka.Writer{
 		Addr:         kafka.TCP(brokers...),
 		Topic:        topic,
@@ -47,7 +52,7 @@ func NewProducer(brokers []string, topic string) (*Producer, error) {
 		WriteTimeout: 2 * time.Second,
 		MaxAttempts:  3,
 	}
-	if err := ensureTopic(brokers, topic); err != nil {
+	if err := ensureTopic(brokers, topic, partitions); err != nil {
 		_ = w.Close()
 		return nil, err
 	}
@@ -116,8 +121,10 @@ func (c *Consumer) Lag() int64 { return c.r.Lag() }
 
 func (c *Consumer) Close() error { return c.r.Close() }
 
-// ensureTopic 幂等创建主题：单分区、副本 1（EXP-09 单 Broker 冻结）。
-func ensureTopic(brokers []string, topic string) error {
+// ensureTopic 幂等创建主题：分区数由参数给定（EXP-10 固定 3 分区）、副本 1。
+// 主题已存在且分区数小于目标时返回错误——分区只增不减，
+// 实验对照需要重建主题（Kafka 事件可从 Outbox 重放，见 EXP-10-manual）。
+func ensureTopic(brokers []string, topic string, partitions int) error {
 	conn, err := kafka.Dial("tcp", brokers[0])
 	if err != nil {
 		return fmt.Errorf("dial kafka %s: %w", brokers[0], err)
@@ -134,8 +141,18 @@ func ensureTopic(brokers []string, topic string) error {
 	}
 	defer cc.Close()
 
+	// 已存在主题的分区数校验（只增不减的约束）。
+	parts, err := cc.ReadPartitions(topic)
+	if err == nil && len(parts) > 0 {
+		if got := len(parts); got < partitions {
+			return fmt.Errorf("topic %s exists with %d partitions < desired %d; "+
+				"recreate topic or set KAFKA_PARTITIONS accordingly", topic, got, partitions)
+		}
+		return nil // 分区数已满足
+	}
+
 	// kafka-go 的 CreateTopics 对 TopicAlreadyExists（36）幂等跳过，不返回错误。
-	tc := kafka.TopicConfig{Topic: topic, NumPartitions: 1, ReplicationFactor: 1}
+	tc := kafka.TopicConfig{Topic: topic, NumPartitions: partitions, ReplicationFactor: 1}
 	if err := cc.CreateTopics(tc); err != nil {
 		return fmt.Errorf("create topic %s: %w", topic, err)
 	}

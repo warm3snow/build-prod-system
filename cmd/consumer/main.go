@@ -72,7 +72,16 @@ func main() {
 		}
 	}()
 
-	proc := consumer.New(store, cons, log, consumer.Config{RetryBackoff: cfg.ConsumerRetryBackoff})
+	proc := consumer.New(store, cons, log, consumer.Config{
+		Concurrency:  cfg.ConsumerConcurrency,
+		MaxInflight:  cfg.ConsumerMaxInflight,
+		BatchSize:    cfg.ConsumerBatchSize,
+		BatchWait:    cfg.ConsumerBatchWait,
+		RetryBackoff: cfg.ConsumerRetryBackoff,
+	})
+	log.Info("consumer config", "concurrency", cfg.ConsumerConcurrency,
+		"max_inflight", cfg.ConsumerMaxInflight, "batch_size", cfg.ConsumerBatchSize,
+		"db_pool", cfg.ConsumerDBMaxOpenConns)
 	runCtx, runCancel := context.WithCancel(context.Background())
 	defer runCancel()
 	go proc.Run(runCtx)

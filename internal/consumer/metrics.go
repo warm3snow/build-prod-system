@@ -27,9 +27,17 @@ var (
 		Name: "kafka_consumer_lag",
 		Help: "消费组 Lag（最新位点 - 已提交位点）。",
 	})
+	inflight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "consumer_inflight",
+		Help: "在途消息数（已取出未完成）；有界队列水位即反压信号。",
+	})
 )
 
-func RecordProcessed(result string)             { processedTotal.WithLabelValues(result).Inc() }
+func RecordProcessed(result string) { processedTotal.WithLabelValues(result).Inc() }
+func RecordProcessedN(result string, n int) {
+	processedTotal.WithLabelValues(result).Add(float64(n))
+}
 func RecordProcessError(op string)              { processErrorsTotal.WithLabelValues(op).Inc() }
 func ObservePostProcessLatency(d time.Duration) { postProcessLatency.Observe(d.Seconds()) }
 func SetKafkaLag(lag int64)                     { kafkaLag.Set(float64(lag)) }
+func AddInflight(delta int)                     { inflight.Add(float64(delta)) }

@@ -94,12 +94,12 @@ func main() {
 		cch = cache.New(cache.Config{
 			RDB: rdb, TTL: cfg.CacheTTL, NegTTL: cfg.NegCacheTTL, OpTimeout: cfg.RedisTimeout,
 			FillDelay: cfg.FillDelay, InvalidateDelay: cfg.InvalidateDelay,
-			CoalesceEnabled:   cfg.CoalesceEnabled,
-			BackfillMaxConcur: cfg.BackfillMaxConcur,
-			BackfillAcquireTO: cfg.BackfillAcquireTO,
-			BackfillTimeout:   cfg.BackfillTimeout,
-			StaleMaxEntries:   cfg.StaleMaxEntries,
-			StaleTTL:          cfg.StaleTTL,
+			CoalesceEnabled:     cfg.CoalesceEnabled,
+			BackfillMaxConcur:   cfg.BackfillMaxConcur,
+			BackfillAcquireTO:   cfg.BackfillAcquireTO,
+			BackfillTimeout:     cfg.BackfillTimeout,
+			StaleMaxEntries:     cfg.StaleMaxEntries,
+			StaleTTL:            cfg.StaleTTL,
 			InvalidateQueueSize: cfg.InvalidateQueueSize,
 		})
 		defer cch.Close()
@@ -108,9 +108,16 @@ func main() {
 			"backfill_max_concur", cfg.BackfillMaxConcur, "backfill_timeout", cfg.BackfillTimeout)
 	}
 
+	// EXP-10 积压反压：后台采样 Outbox PENDING 水位，超过预算时下单被明确拒绝。
+	// bp 始终创建（limit=0 时 Enabled=false，作为对照实验开关）。
+	bp := api.NewBackpressure(store, int64(cfg.OutboxBacklogLimit))
+	bpCtx, bpCancel := context.WithCancel(context.Background())
+	defer bpCancel()
+	go bp.Run(bpCtx, 500*time.Millisecond)
+
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      api.NewServer(store, cch, log).Routes(),
+		Handler:      api.NewServer(store, cch, log, bp).Routes(),
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 	}

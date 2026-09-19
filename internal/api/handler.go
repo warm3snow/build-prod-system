@@ -27,20 +27,23 @@ type Store interface {
 	CreateOrder(ctx context.Context, userID, sku, idemKey, paramHash string, trace event.TraceContext) (*mysql.CreatedOrder, error)
 	GetLatestOrder(ctx context.Context, userID string) (*mysql.CreatedOrder, error)
 	GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]mysql.CreatedOrder, bool, error)
+	CountPendingOutbox(ctx context.Context) (int64, error)
 }
 
 // traceContextKey gin context 键：请求关联上下文（request_id / traceparent）。
 const traceContextKey = "exp09.trace"
 
 // Server HTTP 处理层。cch 为 nil 或缓存禁用时走纯 MySQL 路径（EXP-07 无缓存对照组）。
+// bp 为 nil 或未启用时不施加积压反压（EXP-10 对照实验）。
 type Server struct {
 	store Store
 	cch   *cache.Client
 	log   *slog.Logger
+	bp    *Backpressure
 }
 
-func NewServer(store Store, cch *cache.Client, log *slog.Logger) *Server {
-	return &Server{store: store, cch: cch, log: log}
+func NewServer(store Store, cch *cache.Client, log *slog.Logger, bp *Backpressure) *Server {
+	return &Server{store: store, cch: cch, log: log, bp: bp}
 }
 
 // Routes 返回带日志与指标中间件的 Gin 路由。
@@ -148,6 +151,16 @@ func (s *Server) createOrder(c *gin.Context) {
 		return
 	}
 	paramHash := hashParams(req.UserID, req.SKU, req.Qty)
+
+	// EXP-10 积压反压：事件链路积压超过预算水位时拒绝新下单（503 backlog_limited）。
+	// 检查在事务之前、不扣库存；客户端可用原幂等键在水位回落后重试。
+	if s.bp != nil && s.bp.OverLimit() {
+		RecordOrderRejectedBacklog()
+		writeErr(c, http.StatusServiceUnavailable, "backlog_limited",
+			"event backlog over budget, order temporarily rejected")
+		return
+	}
+
 	// 关联上下文：request_id（中间件生成）+ traceparent（W3C，预留 OTel），
 	// 随事件贯穿 Outbox → Kafka → Consumer，实现 HTTP/Relay/Consumer 全链路关联。
 	trace := traceFromContext(c)

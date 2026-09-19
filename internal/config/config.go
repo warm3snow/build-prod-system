@@ -40,9 +40,10 @@ type Config struct {
 	InvalidateQueueSize int           // 异步失效队列容量；满则丢弃（陈旧由 TTL 兜底）
 
 	// 可靠事件（EXP-09）：Outbox → Kafka → Inbox 去重 → 后置副作用。
-	KafkaBrokers  string // 逗号分隔的 Kafka broker 列表
-	KafkaTopic    string // 订单事件主题（单分区，保序主线）
-	ConsumerGroup string // 消费组 ID
+	KafkaBrokers    string // 逗号分隔的 Kafka broker 列表
+	KafkaTopic      string // 订单事件主题
+	KafkaPartitions int    // 主题分区数（EXP-10 冻结 3；分区只增不减）
+	ConsumerGroup   string // 消费组 ID
 
 	// outbox-relay
 	RelayBatchSize      int           // 每轮投递批次大小
@@ -57,6 +58,14 @@ type Config struct {
 	ConsumerMetricsAddr    string        // Consumer metrics 监听地址
 	ConsumerDBMaxOpenConns int           // Consumer 独立连接池上限（EXP-06 预算预留）
 	ConsumerDBMaxIdleConns int
+	ConsumerConcurrency    int           // 并发 worker 数（EXP-10）
+	ConsumerMaxInflight    int           // 在途消息上限（有界队列 = 反压）
+	ConsumerBatchSize      int           // worker 攒批大小（一批一个事务，1 次 fsync）
+	ConsumerBatchWait      time.Duration // 攒批等待上限
+
+	// Outbox 积压预算（EXP-10 反压）：PENDING 超过该水位时 order-api 拒绝新下单
+	//（503 backlog_limited），防止积压无限增长。
+	OutboxBacklogLimit int
 }
 
 func Load() Config {
@@ -89,9 +98,10 @@ func Load() Config {
 		StaleTTL:            getDur("STALE_TTL", 60*time.Second),
 		InvalidateQueueSize: getInt("INVALIDATE_QUEUE_SIZE", 1024),
 
-		KafkaBrokers:  getEnv("KAFKA_BROKERS", "kafka.order-lab.svc.cluster.local:9092"),
-		KafkaTopic:    getEnv("KAFKA_TOPIC", "orders"),
-		ConsumerGroup: getEnv("CONSUMER_GROUP", "order-consumer"),
+		KafkaBrokers:    getEnv("KAFKA_BROKERS", "kafka.order-lab.svc.cluster.local:9092"),
+		KafkaTopic:      getEnv("KAFKA_TOPIC", "orders"),
+		KafkaPartitions: getInt("KAFKA_PARTITIONS", 3),
+		ConsumerGroup:   getEnv("CONSUMER_GROUP", "order-consumer"),
 
 		RelayBatchSize:      getInt("RELAY_BATCH_SIZE", 100),
 		RelayPollInterval:   getDur("RELAY_POLL_INTERVAL", 500*time.Millisecond),
@@ -102,8 +112,14 @@ func Load() Config {
 
 		ConsumerRetryBackoff:   getDur("CONSUMER_RETRY_BACKOFF", time.Second),
 		ConsumerMetricsAddr:    getEnv("CONSUMER_METRICS_ADDR", ":2114"),
-		ConsumerDBMaxOpenConns: getInt("CONSUMER_DB_MAX_OPEN_CONNS", 4),
-		ConsumerDBMaxIdleConns: getInt("CONSUMER_DB_MAX_IDLE_CONNS", 2),
+		ConsumerDBMaxOpenConns: getInt("CONSUMER_DB_MAX_OPEN_CONNS", 16),
+		ConsumerDBMaxIdleConns: getInt("CONSUMER_DB_MAX_IDLE_CONNS", 8),
+		ConsumerConcurrency:    getInt("CONSUMER_CONCURRENCY", 8),
+		ConsumerMaxInflight:    getInt("CONSUMER_MAX_INFLIGHT", 16),
+		ConsumerBatchSize:      getInt("CONSUMER_BATCH_SIZE", 50),
+		ConsumerBatchWait:      getDur("CONSUMER_BATCH_WAIT", 10*time.Millisecond),
+
+		OutboxBacklogLimit: getInt("OUTBOX_BACKLOG_LIMIT", 200000),
 	}
 }
 

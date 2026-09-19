@@ -173,6 +173,17 @@ func (s *Store) RequeueDead(ctx context.Context) (int64, error) {
 	return res.RowsAffected, nil
 }
 
+// CountPendingOutbox 快速统计 PENDING 事件数（EXP-10 下单反压水位采样用）。
+// 走 idx_outbox_status_id 索引的 COUNT，无锁、低开销。
+func (s *Store) CountPendingOutbox(ctx context.Context) (int64, error) {
+	var n int64
+	if err := s.db.WithContext(ctx).Model(&OutboxEvent{}).
+		Where("status = ?", StatusPending).Count(&n).Error; err != nil {
+		return 0, fmt.Errorf("count pending outbox: %w", err)
+	}
+	return n, nil
+}
+
 // OutboxStats 积压统计：PENDING/DEAD 数量与最老 PENDING 年龄（告警与对账用）。
 type OutboxStats struct {
 	Pending          int64
@@ -200,6 +211,60 @@ func (s *Store) OutboxStats(ctx context.Context) (OutboxStats, error) {
 		st.OldestPendingAge = time.Since(oldest[0].CreatedAt)
 	}
 	return st, nil
+}
+
+// ProcessInboxBatch 批量消费事务（EXP-10）：N 条事件的 Inbox 去重 + 后置副作用
+// 在单个事务内完成（1 次 fsync，突破每事务 fsync 的 ~250/s 串行墙）。
+// 用 INSERT IGNORE 幂等：重复 event_id 被忽略（new 计数只含真正插入的行），
+// 副作用（notification）与 Inbox 同事务同批，唯一性保持。
+// 返回 new/dup 计数；失败（DB 不可用）整批回滚，调用方整批重试（幂等安全）。
+func (s *Store) ProcessInboxBatch(ctx context.Context, events []event.OrderCreated) (newCount, dupCount int, err error) {
+	if len(events) == 0 {
+		return 0, 0, nil
+	}
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		rows := make([]InboxEvent, 0, len(events))
+		notifs := make([]OrderNotification, 0, len(events))
+		now := time.Now()
+		for _, e := range events {
+			payload, err := json.Marshal(e)
+			if err != nil {
+				return fmt.Errorf("marshal event: %w", err)
+			}
+			rows = append(rows, InboxEvent{
+				EventID:   e.EventID,
+				OrderID:   e.OrderID,
+				UserID:    e.UserID,
+				SKU:       e.SKU,
+				Payload:   string(payload),
+				CreatedAt: now,
+			})
+			notifs = append(notifs, OrderNotification{
+				OrderID:   e.OrderID,
+				UserID:    e.UserID,
+				Message:   "order accepted",
+				CreatedAt: now,
+			})
+		}
+		// INSERT IGNORE：重复 event_id 静默忽略（返回受影响行数 = 新插入数）。
+		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows)
+		if res.Error != nil {
+			return fmt.Errorf("batch insert inbox: %w", res.Error)
+		}
+		newCount = int(res.RowsAffected)
+		dupCount = len(events) - newCount
+		// 通知副作用：对整批做 INSERT IGNORE（order_id 唯一）。
+		// dup 事件的通知历史上已随 Inbox 同事务提交，此处被唯一键忽略；
+		// 与逐条路径语义一致：Inbox 存在 ⇒ 通知存在（同事务），dup 不产生新副作用。
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&notifs).Error; err != nil {
+			return fmt.Errorf("batch insert notifications: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return newCount, dupCount, nil
 }
 
 // ProcessInboxEvent 消费事务：Inbox 去重 + 后置副作用，同一事务提交。
