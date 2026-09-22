@@ -51,6 +51,39 @@ var (
 			Help: "因事件积压超过预算水位被拒绝的下单次数（EXP-10 反压）。",
 		},
 	)
+	// EXP-11 准入控制：限流/在途上限/总时间预算三类拒绝分别计数，
+	// 拒绝分类可见是过载实验的验收点（不能全部混在 5xx 里）。
+	httpRateLimitedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "http_rate_limited_total",
+			Help: "被令牌桶限流拒绝的请求数（429 rate_limited）。",
+		},
+	)
+	httpOverloadedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "http_overloaded_total",
+			Help: "因在途请求超过上限被拒绝的请求数（503 overloaded）。",
+		},
+	)
+	httpDeadlineExceededTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "http_deadline_exceeded_total",
+			Help: "超过总时间预算被取消的请求数（504 deadline_exceeded）。",
+		},
+	)
+	httpInflight = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "http_inflight",
+			Help: "当前在途请求数（受 MAX_INFLIGHT 约束）。",
+		},
+	)
+	// EXP-12：非关键依赖降级计数（降级响应仍为 200，需单独指标可见）。
+	depDegradedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "dep_degraded_total",
+			Help: "商品附加信息降级响应次数（200 + degraded=true）。",
+		},
+	)
 )
 
 // MetricsMiddleware 记录 RED 指标。放在路由匹配之后，确保 route 已归一化。
@@ -78,3 +111,15 @@ func RecordOrderReplayed() { ordersReplayedTotal.Inc() }
 
 // RecordOrderRejectedBacklog 积压反压拒绝时调用。
 func RecordOrderRejectedBacklog() { ordersRejectedBacklog.Inc() }
+
+// RecordRateLimited 限流拒绝（429）时调用。
+func RecordRateLimited() { httpRateLimitedTotal.Inc() }
+
+// RecordInflightRejected 在途上限拒绝（503 overloaded）时调用。
+func RecordInflightRejected() { httpOverloadedTotal.Inc() }
+
+// RecordDeadlineExceeded 总时间预算耗尽（504）时调用。
+func RecordDeadlineExceeded() { httpDeadlineExceededTotal.Inc() }
+
+// RecordDepDegraded 非关键依赖降级响应（200 + degraded）时调用。
+func RecordDepDegraded() { depDegradedTotal.Inc() }

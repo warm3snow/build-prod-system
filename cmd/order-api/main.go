@@ -23,6 +23,8 @@ import (
 	"github.com/warm3snow/build-prod-system/internal/cache"
 	"github.com/warm3snow/build-prod-system/internal/config"
 	"github.com/warm3snow/build-prod-system/internal/observability"
+	"github.com/warm3snow/build-prod-system/internal/ratelimit"
+	"github.com/warm3snow/build-prod-system/internal/resilience"
 	"github.com/warm3snow/build-prod-system/internal/store/mysql"
 )
 
@@ -115,9 +117,36 @@ func main() {
 	defer bpCancel()
 	go bp.Run(bpCtx, 500*time.Millisecond)
 
+	// EXP-11 准入控制：限流（令牌桶）＋在途上限＋总时间预算。
+	// RateLimiter 始终创建（rate=0 时 Allow 永远放行，对照实验开关）。
+	adm := api.Admission{
+		RateLimiter: ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst),
+		MaxInflight: cfg.MaxInflight,
+		ReadBudget:  cfg.ReadBudget,
+		WriteBudget: cfg.WriteBudget,
+	}
+
+	// EXP-12 非关键依赖（商品附加信息）：资源隔离 + 熔断 + 降级。
+	// DEP_SIM_ADDR 为空时不创建客户端（/extra 返回 501，不影响其他路由）。
+	var dep *resilience.Client
+	if cfg.DepSimAddr != "" {
+		dep = resilience.NewClient(resilience.DepConfig{
+			Name:          "product-extra",
+			BaseURL:       cfg.DepSimAddr,
+			Timeout:       cfg.DepTimeout,
+			PoolSize:      cfg.DepPoolSize,
+			AcquireTO:     cfg.DepAcquireTO,
+			Isolation:     cfg.DepIsolation,
+			FailThreshold: cfg.DepCBFailThresh,
+			OpenDuration:  cfg.DepCBOpenDur,
+		})
+		log.Info("dependency client enabled", "addr", cfg.DepSimAddr,
+			"timeout", cfg.DepTimeout, "pool", cfg.DepPoolSize, "isolation", cfg.DepIsolation)
+	}
+
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      api.NewServer(store, cch, log, bp).Routes(),
+		Handler:      api.NewServer(store, cch, log, bp, adm, dep).Routes(),
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 	}

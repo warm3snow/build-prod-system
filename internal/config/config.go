@@ -66,6 +66,26 @@ type Config struct {
 	// Outbox 积压预算（EXP-10 反压）：PENDING 超过该水位时 order-api 拒绝新下单
 	//（503 backlog_limited），防止积压无限增长。
 	OutboxBacklogLimit int
+
+	// 准入控制与时间预算（EXP-11）：
+	//   RateLimitRPS：单实例令牌桶速率（0 = 关闭，对照实验开关）；
+	//   RateLimitBurst：桶容量（允许的短突发）；
+	//   MaxInflight：同时处理中的请求硬上限（0 = 关闭）；
+	//   ReadBudget / WriteBudget：读/写路径总截止时间（0 = 不施加）。
+	RateLimitRPS    float64
+	RateLimitBurst  float64
+	MaxInflight     int
+	ReadBudget      time.Duration
+	WriteBudget     time.Duration
+
+	// 非关键依赖（EXP-12 商品附加信息）：资源隔离 + 熔断 + 降级。
+	DepSimAddr       string        // 依赖模拟器地址；空 = 不启用依赖客户端
+	DepTimeout       time.Duration // 单次依赖调用独立超时（写路径 1s 总预算的子预算）
+	DepPoolSize      int           // 依赖调用并发/连接上限（0 = 无隔离，对照实验）
+	DepAcquireTO     time.Duration // 等待依赖槽位的最长时间（有界等待）
+	DepIsolation     bool          // 隔离+熔断总开关（对照实验可关闭）
+	DepCBFailThresh  int           // 熔断连续失败阈值
+	DepCBOpenDur     time.Duration // 熔断冷却时长
 }
 
 func Load() Config {
@@ -120,6 +140,20 @@ func Load() Config {
 		ConsumerBatchWait:      getDur("CONSUMER_BATCH_WAIT", 10*time.Millisecond),
 
 		OutboxBacklogLimit: getInt("OUTBOX_BACKLOG_LIMIT", 200000),
+
+		RateLimitRPS:    getFloat("RATE_LIMIT_RPS", 0),
+		RateLimitBurst:  getFloat("RATE_LIMIT_BURST", 0),
+		MaxInflight:     getInt("MAX_INFLIGHT", 0),
+		ReadBudget:      getDur("READ_BUDGET", 0),
+		WriteBudget:     getDur("WRITE_BUDGET", 0),
+
+		DepSimAddr:      getEnv("DEP_SIM_ADDR", ""),
+		DepTimeout:      getDur("DEP_TIMEOUT", 200*time.Millisecond),
+		DepPoolSize:     getInt("DEP_POOL_SIZE", 8),
+		DepAcquireTO:    getDur("DEP_ACQUIRE_TIMEOUT", 50*time.Millisecond),
+		DepIsolation:    getBool("DEP_ISOLATION", true),
+		DepCBFailThresh: getInt("DEP_CB_FAIL_THRESHOLD", 5),
+		DepCBOpenDur:    getDur("DEP_CB_OPEN_DURATION", 10*time.Second),
 	}
 }
 
@@ -152,6 +186,15 @@ func getInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func getFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

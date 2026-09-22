@@ -285,7 +285,7 @@ spec:
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp10a
+          image: order-api:exp12b
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_DSN
@@ -330,6 +330,40 @@ spec:
             # EXP-10 积压反压：PENDING 超过水位时下单被明确拒绝（503 backlog_limited）
             - name: OUTBOX_BACKLOG_LIMIT
               value: "200000"
+            # EXP-11 准入控制与时间预算：
+            #   RATE_LIMIT_RPS=1500 单实例令牌桶（> 下单 200 TPS 常态，< 单实例 ~2000 req/s 容量，
+            #   在容量之上留出余量，过载时有明确 429 反馈）；BURST=300 允许短突发。
+            #   MAX_INFLIGHT=200 在途硬上限（无排队，超过即 503 overloaded）。
+            #   读/写总时间预算：读 500ms（SLO 200ms 的 2.5 倍），写 1s（SLO 500ms 的 2 倍）。
+            #   对照实验开关：任一设为 0 即关闭该防线。
+            - name: RATE_LIMIT_RPS
+              value: "1500"
+            - name: RATE_LIMIT_BURST
+              value: "300"
+            - name: MAX_INFLIGHT
+              value: "200"
+            - name: READ_BUDGET
+              value: "500ms"
+            - name: WRITE_BUDGET
+              value: "1s"
+            # EXP-12 非关键依赖（商品附加信息）：资源隔离 + 熔断 + 降级。
+            # 依赖调用独立超时 200ms（写路径 1s 总预算的子预算）、并发/连接上限 8、
+            # 有界等待 50ms；连续失败 5 次熔断 10s（半开探测并发 1）。
+            # 对照实验：DEP_ISOLATION=false 关闭隔离与熔断，DEP_POOL_SIZE=0 取消并发上限。
+            - name: DEP_SIM_ADDR
+              value: "http://dep-sim.order-lab.svc.cluster.local:8090"
+            - name: DEP_TIMEOUT
+              value: "200ms"
+            - name: DEP_POOL_SIZE
+              value: "8"
+            - name: DEP_ACQUIRE_TIMEOUT
+              value: "50ms"
+            - name: DEP_ISOLATION
+              value: "true"
+            - name: DEP_CB_FAIL_THRESHOLD
+              value: "5"
+            - name: DEP_CB_OPEN_DURATION
+              value: "10s"
           ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
           startupProbe:
             httpGet: {path: /readyz, port: 8080}
@@ -344,7 +378,10 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
           resources:
-            requests: {cpu: 100m, memory: 64Mi}
+            # EXP-13 校准：requests 从 100m 提至 1 核——100m 只是 EXP-02 的调度占位，
+            # HPA 利用率目标（70% × requests）因此失真（0.07 核/副本，见 EXP-13 报告）。
+            # 实测本应用每副本在 1000 rps 混合负载下约 1 核，requests 应反映真实用量。
+            requests: {cpu: "1", memory: 64Mi}
             # EXP-09 重估：下单路径新增 Outbox 固定开销（uuid+序列化+INSERT）后，
             # 2000 QPS 混合负载下 1 核 limit 打满（实测 0.999 核，引发全链路排队）。
             # 提至 2 核；GOMAXPROCS=2 保持（EXP-05 冻结），预算重估见 EXP-09 报告。
@@ -485,6 +522,95 @@ spec:
   ports:
     - {port: 2114, targetPort: 2114, name: metrics}
 ---
+# EXP-13：order-api HPA（CPU 利用率指标，autoscaling/v2）。
+# 预算约束（EXP-13 冻结，见连接预算表）：
+#   - maxReplicas=5：MySQL max_connections=151，API 每副本 25 + relay 4 + consumer 16
+#     → 5×25+20=145 ≤ 151；6 副本（170）会突破下游连接预算。
+#   - CPU target 70% × requests 100m：requests 必须真实（EXP-05 冻结 100m），
+#     指标来源 metrics-server；瓶颈若不在 CPU（本实验 P1 行锁/MySQL）时，
+#     CPU HPA 只能保护计算资源，扩容收益受下游限制（EXP-13 实测结论）。
+#   - 每副本限流 1500 rps（EXP-11 单实例预算）：集群总限流 = 副本数 × 1500。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-api
+  namespace: order-lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: order-api
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+---
+# EXP-13：PDB——自愿中断（维护驱逐）时保证可用副本下限；不阻止硬故障与直接删除。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-api
+  namespace: order-lab
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: order-api}
+---
+# EXP-12：dependency-simulator 可控依赖模拟器（非关键依赖）。
+# 提供商品附加信息；/control 可实时注入慢响应/持续失败（实验组件，不承载真实数据）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dep-sim
+  namespace: order-lab
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: dep-sim}
+  template:
+    metadata:
+      labels: {app: dep-sim}
+    spec:
+      containers:
+        - name: dep-sim
+          image: dependency-simulator:exp12a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HTTP_ADDR
+              value: ":8090"
+          ports: [{containerPort: 8090}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8090}
+            periodSeconds: 5
+            timeoutSeconds: 2
+          resources:
+            requests: {cpu: 20m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dep-sim
+  namespace: order-lab
+  labels:
+    app: dep-sim
+spec:
+  selector: {app: dep-sim}
+  ports:
+    - {port: 8090, targetPort: 8090}
+---
 # ServiceMonitor：由 monitoring 命名空间的 Prometheus Operator 发现（release 标签匹配）。
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -606,3 +732,33 @@ spec:
           labels: {severity: critical}
           annotations:
             summary: "事件有积压但 consumer 5 分钟内零处理（消费停滞）"
+        # EXP-11：限流/过载/超时告警——准入控制拒绝是容量症状，不是系统错误本身，
+        # 但持续高位说明流量已接近或超过预算，需要容量或扩容决策。
+        - alert: OrderAPIRateLimitedHigh
+          expr: |
+            sum(rate(http_rate_limited_total[5m])) > 100
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api 限流拒绝持续超过 100 req/s，流量超过单实例预算"
+        - alert: OrderAPIInflightHigh
+          expr: http_inflight > 0.8 * 200
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api 在途请求数持续超过上限的 80%，接近过载拒绝边界"
+        - alert: OrderAPIDeadlineHigh
+          expr: |
+            sum(rate(http_deadline_exceeded_total[5m]))
+              / clamp_min(sum(rate(http_requests_total{route=~"/api/.*"}[5m])), 1) > 0.01
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "order-api 超总时间预算（504）的比例超过 1%，下游可能变慢"
+        # EXP-12：非关键依赖熔断打开告警——降级可接受但需要被发现。
+        - alert: DepCircuitOpen
+          expr: dep_circuit_state{dep="product-extra"} == 1
+          for: 2m
+          labels: {severity: warning}
+          annotations:
+            summary: "商品附加信息依赖熔断打开超过 2 分钟（当前以降级响应服务）"

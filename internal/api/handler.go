@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/warm3snow/build-prod-system/internal/cache"
 	"github.com/warm3snow/build-prod-system/internal/event"
+	"github.com/warm3snow/build-prod-system/internal/resilience"
 	"github.com/warm3snow/build-prod-system/internal/store/mysql"
 )
 
@@ -35,25 +36,33 @@ const traceContextKey = "exp09.trace"
 
 // Server HTTP 处理层。cch 为 nil 或缓存禁用时走纯 MySQL 路径（EXP-07 无缓存对照组）。
 // bp 为 nil 或未启用时不施加积压反压（EXP-10 对照实验）。
+// adm 承载 EXP-11 准入控制（限流/在途上限/总时间预算），任一防线关闭即跳过。
+// dep 为非关键依赖客户端（EXP-12 商品附加信息）；nil 时 /extra 返回 501。
 type Server struct {
 	store Store
 	cch   *cache.Client
 	log   *slog.Logger
 	bp    *Backpressure
+	adm   *admissionState
+	dep   *resilience.Client
 }
 
-func NewServer(store Store, cch *cache.Client, log *slog.Logger, bp *Backpressure) *Server {
-	return &Server{store: store, cch: cch, log: log, bp: bp}
+func NewServer(store Store, cch *cache.Client, log *slog.Logger, bp *Backpressure, adm Admission, dep *resilience.Client) *Server {
+	return &Server{store: store, cch: cch, log: log, bp: bp, adm: newAdmissionState(adm), dep: dep}
 }
 
 // Routes 返回带日志与指标中间件的 Gin 路由。
+// 中间件顺序（由外向内）：恢复 → 指标/日志 → 总时间预算 → 限流 → 在途上限 → 业务。
+// 限流与在途拒绝同样落入 RED 指标（status 分类），拒绝分类可观测。
 func (s *Server) Routes() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery(), MetricsMiddleware(), withLogging(s.log))
+	r.Use(s.adm.DeadlineMiddleware(), s.adm.RateLimitMiddleware(), s.adm.InFlightMiddleware())
 	r.GET("/healthz", s.healthz)
 	r.GET("/readyz", s.readyz)
 	r.GET("/api/products/:sku", s.getProduct)
 	r.GET("/api/products/:sku/stock", s.getStock)
+	r.GET("/api/products/:sku/extra", s.getProductExtra)
 	r.POST("/api/orders", s.createOrder)
 	r.GET("/api/orders", s.listOrders)
 	r.GET("/api/orders/latest", s.getLatestOrder)
@@ -101,6 +110,26 @@ func (s *Server) getProduct(c *gin.Context) {
 	}
 	c.Header("X-Cache", "off")
 	c.JSON(http.StatusOK, p)
+}
+
+// getProductExtra 商品附加信息（EXP-12 非关键依赖）：依赖可用时返回附加信息；
+// 依赖慢/失败/熔断时降级——省略附加信息但保持 200（X-Dep: degraded）。
+// 该路径独立于下单：库存事务与幂等约束不经过依赖，不存在"降级为假成功"。
+func (s *Server) getProductExtra(c *gin.Context) {
+	sku := c.Param("sku")
+	if s.dep == nil {
+		writeErr(c, http.StatusNotImplemented, "dep_not_configured", "dependency client not configured")
+		return
+	}
+	extra, err := s.dep.GetExtra(c.Request.Context(), sku)
+	if err != nil {
+		RecordDepDegraded()
+		c.Header("X-Dep", "degraded")
+		c.JSON(http.StatusOK, gin.H{"sku": sku, "extra": nil, "degraded": true})
+		return
+	}
+	c.Header("X-Dep", "ok")
+	c.JSON(http.StatusOK, gin.H{"sku": sku, "extra": extra, "degraded": false})
 }
 
 // getStock 展示库存查询，允许缓存有限陈旧（下单仍以 MySQL 事务为准）。
@@ -241,6 +270,11 @@ func (s *Server) getLatestOrder(c *gin.Context) {
 
 func handleStoreErr(c *gin.Context, err error) {
 	switch {
+	case errIsDeadline(err):
+		// EXP-11 总时间预算耗尽：明确归类为超时（504），不伪装成 500。
+		// context 取消已把无用工作（DB 语句/回源）终止，这里只负责如实上报。
+		RecordDeadlineExceeded()
+		writeErr(c, http.StatusGatewayTimeout, "deadline_exceeded", "request deadline exceeded")
 	case errors.Is(err, mysql.ErrNotFound):
 		writeErr(c, http.StatusNotFound, "not_found", "resource not found")
 	case errors.Is(err, mysql.ErrOutOfStock):

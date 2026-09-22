@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	sqldriver "github.com/go-sql-driver/mysql"
@@ -258,22 +259,32 @@ func tryInsertIdem(tx *gorm.DB, userID, idemKey, paramHash string) (bool, error)
 	return false, fmt.Errorf("insert idempotency: %w", err)
 }
 
-// withTxRetry 在死锁/锁等待时有限重试事务（回退＋抖动，EXP-03 冻结：最多 3 次）。
+// withTxRetry 在死锁/锁等待时有限重试事务（EXP-03 冻结：最多 3 次）。
+// EXP-11 安全重试口径：只在明确可重试错误（1213 死锁 / 1205 锁等待）上重试，
+// 指数退避＋随机抖动（避免并发重试同步撞击热点行），重试总时长受调用方
+// context 总预算约束（预算耗尽即停止，重试不能突破端到端截止时间）。
 func withTxRetry(ctx context.Context, db *gorm.DB, fn func(tx *gorm.DB) error) error {
 	const maxRetries = 3
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
+			// 退避基期 25ms × 2^(attempt-1)，抖动 ±50%：attempt=1 → 12.5~37.5ms，
+			// attempt=2 → 25~75ms，attempt=3 → 50~150ms。总等待上界 ~260ms，
+			// 远小于写路径 1s 总预算，重试不会自我放大。
+			base := 25 * time.Millisecond * (1 << (attempt - 1))
+			jitter := time.Duration(rand.Int64N(int64(base))) // [0, base)
+			backoff := base/2 + jitter
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(attempt) * 25 * time.Millisecond):
+			case <-time.After(backoff):
 			}
 		}
 		lastErr = db.WithContext(ctx).Transaction(fn)
 		if lastErr == nil || !isRetryable(lastErr) {
 			return lastErr
 		}
+		RecordTxRetry()
 	}
 	return lastErr
 }
