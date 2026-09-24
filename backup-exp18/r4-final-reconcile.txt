@@ -1,0 +1,24 @@
+== 全局计数 ==
+  idem_orphan      0
+  idem_total       88813
+  inbox            88813
+  notif            88813
+  orders           88813
+  outbox_dead      0
+  outbox_pending   0
+  outbox_sent      88813
+== 集合一致性 ==
+  [OK       ] orders 无 Outbox 事件                    0   (已提交订单必须有可追踪事件)
+  [OK       ] Outbox SENT 未消费                       0   (重放候选（replay-scope 确定范围）)
+  [OK       ] Inbox 孤儿事件                            0   (Inbox 必须能回溯 Outbox)
+  [OK       ] orders 无通知                            0   (重放完成后应为 0)
+  [OK       ] 通知无对应订单                               0   (副作用不可超出订单集)
+  [OK       ] 幂等孤儿（order_id=0）                      0   (占位未回填残留)
+  [OK       ] Outbox DEAD                           0   (显式失败记录，需人工处理)
+== 库存守恒差分（对照基线 backup-exp18/baseline-snapshot.json）==
+  OK：全部 10000 个 SKU 差分守恒（Δorders+Δstock=0）
+== 账本逐单核验（backup-exp18/ledger-r1.txt）==
+  账本唯一订单 17705：verified=17705 lost=0 mismatch=0
+  在窗未确认订单（DB 有、账本无，合法的响应未知态）：0
+
+RESULT: PASS

@@ -98,3 +98,12 @@
 | Leader 强杀 | T+20s 内分区/Controller Leader 双切换；PENDING ≤15 瞬时；下单零影响；对账 66506 全绿 | EXP-17 |
 | 双杀（多数派失守） | NotEnoughReplicas 明确拒写 + Coordinator 不可用（元数据停摆）；PENDING 瞬时 658 → T+37s 排空；终局 76713 四表 1:1:1 | EXP-17 |
 | K8s 多清单纪律 | 同名 Service 会被 apply 相互覆写 selector（EXP-17 实测全集群 DNS 失效）；退役组件清单定义必须同步删除（ADR-037） | EXP-17 |
+| 备份主线（EXP-18 冻结） | mysqldump --single-transaction --source-data=2 --set-gtid-purged + binlog 归档至宿主机（故障域外）；产物 SHA256 留档 | EXP-18 |
+| RTO 实测 | 全量档 2min49s（写入恢复）；PITR 档 ≈7min38s（binlog 重放 3min04s 主导）——目标 ≤30min 达标 | EXP-18 |
+| RPO 实测 | 全量档 = 11128 单丢失（(T_b,T_f] ≈25min 窗口，清单落档）；PITR 档 = 0（GTID 与水位双对齐，账本 17705 全 verified） | EXP-18 |
+| 备份代价 | 负载中备份：dump 扫表挤占 128M buffer pool + tar 页缓存污染 → 5xx 10.4%、secondary OOMKilled（实验前已 1500/1536Mi）——备份期是第三档资源预算 | EXP-18 |
+| 恢复代隔离 | 每 DR 代新 topic（删旧重建）+ 新消费组（FirstOffset）；consumer 必须在 topic 存在后入组（否则 0 分区分配、无自动重平衡）——Runbook 顺序 ADR-039 | EXP-18 |
+| 过载复核（HA 档） | 900 rps：有效吞吐封顶 ~820/s，1.69% 明确拒绝（429×1173/504×1479/503×196/500×14），无雪崩 | EXP-19 |
+| 剩余容量 | 热（缓存）下单 api+单 router 扛 600 rps：0.19% 失败、读 p95 148ms ✓、写 p95 553ms 边缘 | EXP-19 |
+| Game Day（Redis 停机+Pod 强杀） | 总失败 44.22%（读 503 有界拒绝为主，stale 库 1024 键 << 20000 键空间）；写路径存活 22275 单零丢失；三条症状告警全链路验证；Redis 无持久化→恢复=冷缓存重预热风暴 | EXP-19 |
+| 2h 长稳（否定结论） | 相变塌陷：热缓存相（6min，60 TPS）→ 回源刀锋均衡（34min，16-20 TPS）→ 写路径塌陷（80min，**0 TPS**）；全程内存平稳/队列有界/数据零损伤（47540 verified）——机制：TTL 过期需求 33/s ≈ 回源容量 24-52/s 零余量；短窗口（≤12min）结构上不可见 | EXP-19 |

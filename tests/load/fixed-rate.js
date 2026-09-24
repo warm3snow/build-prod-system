@@ -52,6 +52,13 @@ export default function () {
       }
     );
     check(res, { 'order accepted': (x) => [200, 201, 409].includes(x.status) });
+    // EXP-18 成功响应账本：客户端已收到成功响应的订单逐单记录（200 重放与 201 首发
+    // 指向同一 order_id，对账器按 id 去重）。输出经 nohup 日志落盘，事后提取到
+    // 故障域外——「成功订单不丢」核验的判定性证据。
+    if (__ENV.LEDGER === '1' && (res.status === 200 || res.status === 201)) {
+      const o = res.json();
+      console.log(`LEDGER|${o.id}|fr-u-${__VU}|P1|${key}|${Date.now()}`);
+    }
     return;
   }
   const res = http.get(`${BASE_URL}/api/orders/latest?user_id=fr-u-1`, {

@@ -1,0 +1,284 @@
+# EXP-18：独立备份恢复栈（Namespace order-dr）。
+# 主线：原数据环境（order-lab 的 mysql-ic + router + PVC）隔离后，在新 Namespace
+# 新卷上从「故障域外的备份」恢复业务；恢复流程按受控顺序分步拉起：
+#
+#   1. mysql-dr（replicas 1）：空卷 + GTID 开启（PITR 前提，mysqldump 的
+#      SET @@GLOBAL.gtid_purged 要求目标 gtid_executed 为空且 gtid_mode=ON）
+#   2. 导入全量 dump（kubectl exec -i stdin，从宿主机故障域外灌入）
+#   3. （PITR 档）mysqlbinlog 重放归档 binlog——已执行 GTID 自动跳过，只补增量
+#   4. 对账（cmd/reconcile）：水位、守恒、账本逐单
+#   5. order-api 恢复写入（replicas 0→1，受控顺序：核验通过才开写）
+#   6. relay + consumer：隔离 Topic orders-dr-replay + 新消费组 order-consumer-dr
+#      重放未完成事件（保留原 event_id，Inbox 去重吸收重复投递）
+#
+# 设计取舍：
+#   - DR 档 MySQL 为单实例：本实验验证「备份与恢复流程」，不重复 EXP-16 的 HA 命题；
+#     恢复后如需 HA，按 EXP-16 Runbook 重新引导集群（记录为边界，不在本实验范围）。
+#   - 复用 order-lab 的 kafka-i 集群（跨 Namespace）承载隔离 Topic：Kafka 事件可
+#     重建、真相在 Outbox（EXP-09/17 结论），隔离 Topic + 新消费组保证不消费
+#     恢复点之后的旧事件、不复用领先位址。
+#   - CACHE_ENABLED=false：Redis 只存可重建缓存（roadmap §2.1），DR 档读直连 DB；
+#     恢复验证不受缓存层干扰。
+#   - order-api/relay/consumer 初始 replicas=0：受控恢复顺序由 Runbook 逐步拉起，
+#     避免空库自动建表（AutoMigrate）先于数据导入、或 relay 提前消费空表。
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: order-dr
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: order-dr
+type: Opaque
+stringData:
+  MYSQL_ROOT_PASSWORD: flash-root
+  MYSQL_DATABASE: flash
+  MYSQL_USER: flash
+  MYSQL_PASSWORD: flash
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dr-mysql-data
+  namespace: order-dr
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 3Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-dr
+  namespace: order-dr
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mysql-dr}
+  template:
+    metadata:
+      labels: {app: mysql-dr}
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_ROOT_PASSWORD}}
+            - name: MYSQL_DATABASE
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_DATABASE}}
+            - name: MYSQL_USER
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_USER}}
+            - name: MYSQL_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_PASSWORD}}
+          # 只传标准变量（GTID/log_bin 8.0 默认开启；binlog_checksum=NONE 与源库
+          # InnoDB Cluster 的 GR 约束保持一致，归档 binlog 重放无 checksum 差异）。
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              exec /usr/local/bin/docker-entrypoint.sh mysqld \
+                --server-id=99 \
+                --gtid-mode=ON \
+                --enforce-gtid-consistency=ON \
+                --binlog_checksum=NONE
+          ports: [{containerPort: 3306}]
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h 127.0.0.1 -uflash -pflash"]
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            # DR 档预算：原环境冻结（mysql-ic ×3 + router ×2 + order-api ×2 约
+            # 释放 3.9 核 request）后单实例恢复；binlog 重放期 CPU 峰值给 2 核。
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 1536Mi}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dr-mysql-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-dr
+  namespace: order-dr
+spec:
+  selector: {app: mysql-dr}
+  ports: [{port: 3306, targetPort: 3306}]
+---
+# order-api（DR 档）：核验通过后由 Runbook scale 0→1 恢复写入。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+  namespace: order-dr
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: order-api}
+  template:
+    metadata:
+      labels: {app: order-api}
+    spec:
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: order-api
+          image: order-api:exp17a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql-dr.order-dr.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            - name: GOMAXPROCS
+              value: "2"
+            - name: DB_MAX_OPEN_CONNS
+              value: "25"
+            - name: DB_MAX_IDLE_CONNS
+              value: "10"
+            # DR 档无 Redis：纯缓存可重建，读直连 DB（恢复验证不受缓存层干扰）。
+            - name: CACHE_ENABLED
+              value: "false"
+            - name: OUTBOX_BACKLOG_LIMIT
+              value: "200000"
+            - name: RATE_LIMIT_RPS
+              value: "1500"
+            - name: RATE_LIMIT_BURST
+              value: "300"
+            - name: MAX_INFLIGHT
+              value: "200"
+            - name: READ_BUDGET
+              value: "500ms"
+            - name: WRITE_BUDGET
+              value: "1s"
+          ports: [{containerPort: 8080}, {containerPort: 2112, name: metrics}]
+          startupProbe:
+            httpGet: {path: /readyz, port: 8080}
+            failureThreshold: 30
+            periodSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8080}
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            requests: {cpu: "1", memory: 64Mi}
+            limits: {cpu: "2", memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api
+  namespace: order-dr
+spec:
+  selector: {app: order-api}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+# relay（DR 档）：向隔离 Topic orders-dr-replay 投递（ensureTopic 显式建
+# RF=3/minISR=2，与生产 topic 同规格）；事件保留原 event_id（payload 内）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: outbox-relay
+  namespace: order-dr
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: outbox-relay}
+  template:
+    metadata:
+      labels: {app: outbox-relay}
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: outbox-relay
+          image: outbox-relay:exp17a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql-dr.order-dr.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            - name: RELAY_DB_MAX_OPEN_CONNS
+              value: "4"
+            - name: RELAY_DB_MAX_IDLE_CONNS
+              value: "2"
+            # 复用 order-lab 的 kafka-i 集群（跨 Namespace）；隔离 Topic 保证
+            # DR 重放不污染生产 topic，也不消费恢复点之后的旧事件。
+            - name: KAFKA_BROKERS
+              value: "kafka-i-0.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-1.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-2.kafka-hs.order-lab.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "orders-dr-replay"
+            - name: KAFKA_RF
+              value: "3"
+            - name: KAFKA_MIN_ISR
+              value: "2"
+            - name: KAFKA_PARTITIONS
+              value: "3"
+            - name: RELAY_BATCH_SIZE
+              value: "200"
+            - name: RELAY_POLL_INTERVAL
+              value: "200ms"
+            - name: OUTBOX_MAX_ATTEMPTS
+              value: "100"
+            - name: RELAY_METRICS_ADDR
+              value: ":2113"
+          ports: [{containerPort: 2113, name: metrics}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+# consumer（DR 档）：新消费组 order-consumer-dr 从 FirstOffset 消费隔离 Topic；
+# 位点从零起（不复用领先于恢复数据的旧位点），重复投递由恢复的 Inbox 去重。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer
+  namespace: order-dr
+spec:
+  replicas: 0
+  selector:
+    matchLabels: {app: consumer}
+  template:
+    metadata:
+      labels: {app: consumer}
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: consumer
+          image: consumer:exp17a
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: DB_DSN
+              value: "flash:flash@tcp(mysql-dr.order-dr.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+            - name: CONSUMER_DB_MAX_OPEN_CONNS
+              value: "16"
+            - name: CONSUMER_DB_MAX_IDLE_CONNS
+              value: "8"
+            - name: KAFKA_BROKERS
+              value: "kafka-i-0.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-1.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-2.kafka-hs.order-lab.svc.cluster.local:9092"
+            - name: KAFKA_TOPIC
+              value: "orders-dr-replay"
+            - name: CONSUMER_GROUP
+              value: "order-consumer-dr"
+            - name: CONSUMER_METRICS_ADDR
+              value: ":2114"
+            - name: CONSUMER_CONCURRENCY
+              value: "8"
+            - name: CONSUMER_MAX_INFLIGHT
+              value: "16"
+            - name: CONSUMER_BATCH_SIZE
+              value: "50"
+            - name: CONSUMER_BATCH_WAIT
+              value: "10ms"
+          ports: [{containerPort: 2114, name: metrics}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 250m, memory: 128Mi}
