@@ -1,0 +1,122 @@
+# EXP-17 HA 档：Kafka KRaft 集群（3 Broker / 3 Controller，combined 模式）。
+# 结构：Headless Service（kafka-hs：quorum 9093 + per-broker DNS）
+#       → StatefulSet kafka-i × 3（每进程 broker+controller，独立 PVC）
+#       → Service kafka（client 9092）。
+#
+# 设计（EXP-17 冻结）：
+#   - combined 角色（资源受限档；broker/controller 分离部署为选做）；
+#   - NODE_ID 按序号 +1（1/2/3），quorum voters 全成员；
+#   - Topic orders 由 relay 启动时显式创建：partitions=3、RF=3、min.isr=2
+#     （KAFKA_RF/KAFKA_MIN_ISR env，ADR 见报告）；
+#   - 旧单实例 kafka-0 退役（all.yaml scale 0，PVC kafka-data 保留存档）。
+#
+# 资源预算（EXP-16 HA 档之上）：旧 kafka（250m/1 核；512Mi/2Gi）退役，
+# 新 3 ×（250m req / 750m limit；512Mi req / 1.5Gi limit；heap 512m；PVC 2Gi）。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-hs
+  namespace: order-lab
+spec:
+  clusterIP: None
+  # KRaft quorum 成员在「就绪前」就必须互相解析（否则 UnknownHostException
+  # 鸡生蛋死锁：DNS 只发布 Ready 端点，而 Ready 又依赖 quorum 成立）。
+  publishNotReadyAddresses: true
+  selector: {app: kafka-i}
+  ports:
+    - {port: 9093, targetPort: 9093, name: controller}
+    - {port: 9092, targetPort: 9092, name: client}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-i
+  namespace: order-lab
+spec:
+  serviceName: kafka-hs
+  replicas: 3
+  # KRaft 引导必须并行启动：OrderedReady 下 node-1 独自等待 quorum（2/3）
+  # 无法 Ready → STS 永不创建后续成员 → 死锁（实测踩坑）。
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: kafka-i}
+  template:
+    metadata:
+      labels: {app: kafka-i}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: kafka
+          image: apache/kafka:3.9.0
+          # KAFKA_NODE_ID 需要纯数字：启动脚本从 HOSTNAME 提取序号导出。
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              ORD=${HOSTNAME##*-}
+              export KAFKA_NODE_ID=$((ORD + 1))
+              HOSTFQDN=${HOSTNAME}.kafka-hs.order-lab.svc.cluster.local
+              export KAFKA_PROCESS_ROLES="broker,controller"
+              export KAFKA_LISTENERS="PLAINTEXT://:9092,CONTROLLER://:9093"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTFQDN}:9092"
+              export KAFKA_LISTENER_SECURITY_PROTOCOL_MAP="CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+              export KAFKA_CONTROLLER_LISTENER_NAMES="CONTROLLER"
+              export KAFKA_CONTROLLER_QUORUM_VOTERS="1@kafka-i-0.kafka-hs.order-lab.svc.cluster.local:9093,2@kafka-i-1.kafka-hs.order-lab.svc.cluster.local:9093,3@kafka-i-2.kafka-hs.order-lab.svc.cluster.local:9093"
+              export KAFKA_INTER_BROKER_LISTENER_NAME="PLAINTEXT"
+              # 内部主题多副本（__consumer_offsets / transaction state）：
+              # HA 档 RF=3 / min.isr=2；单 Broker 档曾为 1/1。
+              export KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=3
+              export KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS=3
+              export KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=3
+              export KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=2
+              export KAFKA_DEFAULT_REPLICATION_FACTOR=3
+              export KAFKA_MIN_INSYNC_REPLICAS=2
+              export KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+              # 固定 cluster.id（22 字符 base64），重启保持同一集群
+              export KAFKA_CLUSTER_ID="AAAAAAAAAAAAAAAAAAAAAA"
+              # EXP-10 预算沿用：24h 或 1.5GiB（低于 PVC 2Gi）
+              export KAFKA_LOG_RETENTION_HOURS=24
+              export KAFKA_LOG_RETENTION_BYTES=1610612736
+              export KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+              export KAFKA_HEAP_OPTS="-Xmx512m -Xms256m"
+              exec /etc/kafka/docker/run
+          ports:
+            - {containerPort: 9092, name: client}
+            - {containerPort: 9093, name: controller}
+          readinessProbe:
+            exec:
+              command: ["/bin/bash", "-c", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server=localhost:9092"]
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            timeoutSeconds: 8
+          livenessProbe:
+            # EXP-10 教训：liveness 只判进程存活，负载尖峰下放宽（60s×3×15s）
+            exec:
+              command: ["/bin/bash", "-c", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server=localhost:9092"]
+            periodSeconds: 60
+            timeoutSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: 750m, memory: 1536Mi}
+          volumeMounts:
+            - name: data
+              mountPath: /tmp/kafka-logs
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: order-lab
+spec:
+  selector: {app: kafka-i}
+  ports:
+    - {port: 9092, targetPort: 9092, name: client}

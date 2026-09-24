@@ -84,7 +84,14 @@ var (
 			Help: "商品附加信息降级响应次数（200 + degraded=true）。",
 		},
 	)
-)
+	// EXP-15：坏版本注入计数（BAD_MODE 生效的可观测证据，与发布门禁联动）。
+	badReleaseTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "release_bad_mode_total",
+			Help: "坏版本注入拦截的下单请求数（BAD_MODE 开关触发）。",
+		},
+	)
+	)
 
 // MetricsMiddleware 记录 RED 指标。放在路由匹配之后，确保 route 已归一化。
 func MetricsMiddleware() gin.HandlerFunc {
@@ -123,3 +130,6 @@ func RecordDeadlineExceeded() { httpDeadlineExceededTotal.Inc() }
 
 // RecordDepDegraded 非关键依赖降级响应（200 + degraded）时调用。
 func RecordDepDegraded() { depDegradedTotal.Inc() }
+
+// RecordBadRelease 坏版本注入拦截时调用（EXP-15 发布门禁证据）。
+func RecordBadRelease() { badReleaseTotal.Inc() }

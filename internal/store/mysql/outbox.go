@@ -256,7 +256,12 @@ func (s *Store) ProcessInboxBatch(ctx context.Context, events []event.OrderCreat
 		// 通知副作用：对整批做 INSERT IGNORE（order_id 唯一）。
 		// dup 事件的通知历史上已随 Inbox 同事务提交，此处被唯一键忽略；
 		// 与逐条路径语义一致：Inbox 存在 ⇒ 通知存在（同事务），dup 不产生新副作用。
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&notifs).Error; err != nil {
+		// EXP-16 修正：不能使用 OnConflict{DoNothing}——GORM 在 MySQL 上把它渲染为
+		// ON DUPLICATE KEY UPDATE id=id，带自增列的表在 Group Replication 上触发
+		// Error 1869（auto-increment 值与内部生成值冲突，单实例 MySQL 无此行为；
+		// failover 重投产生的批内 dup 是稳定触发路径）。改用真正的 INSERT IGNORE
+		// （无 UPDATE 子句，冲突行静默跳过）。
+		if err := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&notifs).Error; err != nil {
 			return fmt.Errorf("batch insert notifications: %w", err)
 		}
 		return nil
@@ -298,8 +303,10 @@ func (s *Store) ProcessInboxEvent(ctx context.Context, e event.OrderCreated) (bo
 			Message:   "order accepted",
 			CreatedAt: time.Now(),
 		}
-		// 冲突兜底：Inbox 已去重，理论上不会冲突；OnConflict 仅防御异常历史数据。
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&notif).Error; err != nil {
+		// 冲突兜底：Inbox 已去重，理论上不会冲突；防御异常历史数据。
+		// INSERT IGNORE（非 OnConflict{DoNothing}）：避免 GR 上的 Error 1869，
+		// 见 ProcessInboxBatch 内注释。
+		if err := tx.Clauses(clause.Insert{Modifier: "IGNORE"}).Create(&notif).Error; err != nil {
 			return fmt.Errorf("insert notification: %w", err)
 		}
 		return nil

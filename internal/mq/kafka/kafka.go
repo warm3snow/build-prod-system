@@ -32,8 +32,8 @@ type Producer struct {
 // NewProducer 创建生产者并确保主题存在（幂等创建）。
 // EXP-10：分区数由调用方传入（KAFKA_PARTITIONS）；已存在主题分区数不足时
 // 返回错误（分区只增不减，实验对照用不同主题名或手动 alter，见 EXP-10-manual）。
-// 实验为单 Broker，Kafka 未就绪时创建失败会返回错误（启动重试由调用方负责）。
-func NewProducer(brokers []string, topic string, partitions int) (*Producer, error) {
+// EXP-17：RF/minISR 由调用方传入（HA 档 3/2；单 Broker 档 1/0=不设置）。
+func NewProducer(brokers []string, topic string, partitions, rf, minISR int) (*Producer, error) {
 	if partitions <= 0 {
 		partitions = 1
 	}
@@ -52,7 +52,7 @@ func NewProducer(brokers []string, topic string, partitions int) (*Producer, err
 		WriteTimeout: 2 * time.Second,
 		MaxAttempts:  3,
 	}
-	if err := ensureTopic(brokers, topic, partitions); err != nil {
+	if err := ensureTopic(brokers, topic, partitions, rf, minISR); err != nil {
 		_ = w.Close()
 		return nil, err
 	}
@@ -121,10 +121,11 @@ func (c *Consumer) Lag() int64 { return c.r.Lag() }
 
 func (c *Consumer) Close() error { return c.r.Close() }
 
-// ensureTopic 幂等创建主题：分区数由参数给定（EXP-10 固定 3 分区）、副本 1。
+// ensureTopic 幂等创建主题：分区/副本由参数给定（EXP-17：RF 与 min.insync.replicas
+// 显式传入，不依赖 broker 默认——多副本投递语义必须落在 topic 配置上）。
 // 主题已存在且分区数小于目标时返回错误——分区只增不减，
 // 实验对照需要重建主题（Kafka 事件可从 Outbox 重放，见 EXP-10-manual）。
-func ensureTopic(brokers []string, topic string, partitions int) error {
+func ensureTopic(brokers []string, topic string, partitions, rf, minISR int) error {
 	conn, err := kafka.Dial("tcp", brokers[0])
 	if err != nil {
 		return fmt.Errorf("dial kafka %s: %w", brokers[0], err)
@@ -152,7 +153,12 @@ func ensureTopic(brokers []string, topic string, partitions int) error {
 	}
 
 	// kafka-go 的 CreateTopics 对 TopicAlreadyExists（36）幂等跳过，不返回错误。
-	tc := kafka.TopicConfig{Topic: topic, NumPartitions: partitions, ReplicationFactor: 1}
+	tc := kafka.TopicConfig{Topic: topic, NumPartitions: partitions, ReplicationFactor: rf}
+	if minISR > 0 {
+		tc.ConfigEntries = append(tc.ConfigEntries, kafka.ConfigEntry{
+			ConfigName: "min.insync.replicas", ConfigValue: strconv.Itoa(minISR),
+		})
+	}
 	if err := cc.CreateTopics(tc); err != nil {
 		return fmt.Errorf("create topic %s: %w", topic, err)
 	}

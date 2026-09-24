@@ -38,7 +38,11 @@ metadata:
   name: mysql
   namespace: order-lab
 spec:
-  replicas: 1
+  # EXP-16：单实例 MySQL 退役（副本 0）——数据层切换到 InnoDB Cluster
+  # （deploy/k8s/ha/mysql-innodb-cluster.yaml，经 mysql-router 访问）。
+  # PVC mysql-data 保留：EXP-04~15 的历史数据存档，不做迁移
+  # （HA 集群从空库开始，新窗口对账从 0 计）。
+  replicas: 0
   selector:
     matchLabels: {app: mysql}
   template:
@@ -153,15 +157,9 @@ spec:
     requests:
       storage: 2Gi
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: kafka-hs
-  namespace: order-lab
-spec:
-  clusterIP: None
-  selector: {app: kafka}
-  ports: [{port: 9093, targetPort: 9093, name: controller}]
+# EXP-17：旧单实例 kafka 的 kafka-hs/kafka Service 已移除——
+# 同名 Service 由 deploy/k8s/ha/kafka-kraft.yaml 定义（selector app: kafka-i）。
+# 教训：多清单同名资源会被 apply 相互覆写，同名即冲突。
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -170,7 +168,10 @@ metadata:
   namespace: order-lab
 spec:
   serviceName: kafka-hs
-  replicas: 1
+  # EXP-17：单 Broker Kafka 退役（副本 0）——消息层切换到 KRaft 3 集群
+  # （deploy/k8s/ha/kafka-kraft.yaml）。PVC kafka-data 保留：EXP-09~16 的
+  # 历史 topic 数据存档（事件真相在 Outbox，不迁移）。
+  replicas: 0
   selector:
     matchLabels: {app: kafka}
   template:
@@ -259,22 +260,26 @@ spec:
           persistentVolumeClaim:
             claimName: kafka-data
 ---
-apiVersion: v1
-kind: Service
-metadata:
-  name: kafka
-  namespace: order-lab
-spec:
-  selector: {app: kafka}
-  ports: [{port: 9092, targetPort: 9092, name: client}]
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: order-api
   namespace: order-lab
 spec:
-  replicas: 1
+  # EXP-14：固定 3 副本（应用故障域实验）。HPA 在 EXP-13 已证明
+  # DB 瓶颈下会误扩（锁等待烧 CPU 被当成负载信号），故障实验期间删除 HPA。
+  # 滚动策略 maxSurge=0/maxUnavailable=1：先停后起、峰值不超过 3 副本——
+  # 节点 request 预算（3×1 核 + 监控栈 ≈ 5.5/6 核）不允许 surge 副本；
+  # 且 PDB 不约束 Deployment 自身的滚动更新（直接删除 Pod），
+  # 发布可用性必须由 Deployment 策略自己保证（EXP-15 复用的基线配置）。
+  # EXP-16 HA 档：3→2 副本——单机 6 核预算让位给 mysql-ic × 3
+  # （应用双副本 + PDB minAvailable 2 已不成立，同步下调为 minAvailable 1）。
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels: {app: order-api}
   template:
@@ -282,14 +287,26 @@ spec:
       labels: {app: order-api}
     spec:
       terminationGracePeriodSeconds: 15
+      # EXP-14：副本分散声明。单节点环境无实际分散效果（ScheduleAnyway），
+      # 声明存在并在多节点 HA 档（EXP-16/17 环境）生效。
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: order-api}
       containers:
         - name: order-api
           # 本地构建镜像；同 tag 重建时 k8s 可能复用旧镜像，改 tag 后重新 apply
-          image: order-api:exp12b
+          # EXP-15 起主线版本固定 exp15a（channel 字段 + BAD_MODE 开关）。
+          # 教训（EXP-13/16 两次踩坑）：kubectl apply 会把 set image 的运行值
+          # 重置回清单值——发布变更必须回写清单（单一事实源）。
+          image: order-api:exp17a
           imagePullPolicy: IfNotPresent
           env:
+            # EXP-16：DSN 切换到 mysql-router（6446 读写口，PRIMARY 感知路由）
             - name: DB_DSN
-              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+              value: "flash:flash@tcp(mysql-router.order-lab.svc.cluster.local:6446)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
             # EXP-05 实验 B：GOMAXPROCS=2 配合 1000m limit（I/O 密集负载 1 核 2 线程）
             - name: GOMAXPROCS
               value: "2"
@@ -309,8 +326,13 @@ spec:
               value: "128"
             - name: CACHE_ENABLED
               value: "true"
+            # EXP-16 HA 档：TTL 60s→600s。单实例档回源 2ms，12 槽位容量 ~6000/s，
+            # TTL 60s 的稳态回源（10000 SKU×2 端点/60s ≈ 333/s）轻松消化；
+            # HA 档回源经 qemu Router ~100-300ms，容量仅 ~100/s，TTL 60s 引发
+            # 回源风暴（503 rejected 7 万+，见报告 F1）。商品不可变（无陈旧）；
+            # P1 库存由下单失效路径保持新鲜，其余 SKU 库存不变。
             - name: CACHE_TTL
-              value: "60s"
+              value: "600s"
             - name: NEG_CACHE_TTL
               value: "5s"
             # EXP-08 有界回源：请求合并、回源并发/等待/超时上限、旧值降级。
@@ -418,19 +440,28 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: outbox-relay
-          image: outbox-relay:exp10a
+          image: outbox-relay:exp17a
           imagePullPolicy: IfNotPresent
           env:
+            # EXP-16：DSN 切换到 mysql-router（6446 读写口，PRIMARY 感知路由）
             - name: DB_DSN
-              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+              value: "flash:flash@tcp(mysql-router.order-lab.svc.cluster.local:6446)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
             - name: RELAY_DB_MAX_OPEN_CONNS
               value: "4"
             - name: RELAY_DB_MAX_IDLE_CONNS
               value: "2"
+            # EXP-17：切换到 KRaft 3 Broker 集群（全成员 bootstrap，
+            # 单地址故障时客户端仍可发现集群）
             - name: KAFKA_BROKERS
-              value: "kafka.order-lab.svc.cluster.local:9092"
+              value: "kafka-i-0.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-1.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-2.kafka-hs.order-lab.svc.cluster.local:9092"
             - name: KAFKA_TOPIC
               value: "orders"
+            # EXP-17：RF=3 + min.isr=2 + acks=all（代码内冻结）——
+            # 1 副本故障仍可写；2 副本故障 NotEnoughReplicas 明确拒写。
+            - name: KAFKA_RF
+              value: "3"
+            - name: KAFKA_MIN_ISR
+              value: "2"
             # EXP-10：3 分区（固定），分区 key=event_id hash
             - name: KAFKA_PARTITIONS
               value: "3"
@@ -478,17 +509,19 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: consumer
-          image: consumer:exp10a
+          image: consumer:exp17a
           imagePullPolicy: IfNotPresent
           env:
+            # EXP-16：DSN 切换到 mysql-router（6446 读写口，PRIMARY 感知路由）
             - name: DB_DSN
-              value: "flash:flash@tcp(mysql.order-lab.svc.cluster.local:3306)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
+              value: "flash:flash@tcp(mysql-router.order-lab.svc.cluster.local:6446)/flash?parseTime=true&timeout=2s&readTimeout=2s&writeTimeout=2s"
             - name: CONSUMER_DB_MAX_OPEN_CONNS
               value: "16"
             - name: CONSUMER_DB_MAX_IDLE_CONNS
               value: "8"
+            # EXP-17：切换到 KRaft 3 Broker 集群
             - name: KAFKA_BROKERS
-              value: "kafka.order-lab.svc.cluster.local:9092"
+              value: "kafka-i-0.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-1.kafka-hs.order-lab.svc.cluster.local:9092,kafka-i-2.kafka-hs.order-lab.svc.cluster.local:9092"
             - name: KAFKA_TOPIC
               value: "orders"
             - name: CONSUMER_GROUP
@@ -523,41 +556,46 @@ spec:
     - {port: 2114, targetPort: 2114, name: metrics}
 ---
 # EXP-13：order-api HPA（CPU 利用率指标，autoscaling/v2）。
+# EXP-14 起注释停用：故障域实验使用固定 3 副本（HPA 在 DB 瓶颈下误扩，
+# EXP-13 实测结论；故障实验中扩缩容变量会污染恢复计时）。
+# 恢复条件：写路径瓶颈显式化后（业务改造，超出课程主线）或换业务指标 HPA。
 # 预算约束（EXP-13 冻结，见连接预算表）：
 #   - maxReplicas=5：MySQL max_connections=151，API 每副本 25 + relay 4 + consumer 16
 #     → 5×25+20=145 ≤ 151；6 副本（170）会突破下游连接预算。
-#   - CPU target 70% × requests 100m：requests 必须真实（EXP-05 冻结 100m），
-#     指标来源 metrics-server；瓶颈若不在 CPU（本实验 P1 行锁/MySQL）时，
+#   - CPU target 70% × requests：requests 必须真实（EXP-13 校准为 1 核），
+#     指标来源 metrics-server；瓶颈若不在 CPU（P1 行锁/MySQL）时，
 #     CPU HPA 只能保护计算资源，扩容收益受下游限制（EXP-13 实测结论）。
 #   - 每副本限流 1500 rps（EXP-11 单实例预算）：集群总限流 = 副本数 × 1500。
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: order-api
-  namespace: order-lab
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: order-api
-  minReplicas: 1
-  maxReplicas: 5
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-  behavior:
-    scaleDown:
-      stabilizationWindowSeconds: 60
-      policies:
-        - type: Percent
-          value: 50
-          periodSeconds: 60
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: order-api
+#   namespace: order-lab
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: order-api
+#   minReplicas: 1
+#   maxReplicas: 5
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 70
+#   behavior:
+#     scaleDown:
+#       stabilizationWindowSeconds: 60
+#       policies:
+#         - type: Percent
+#           value: 50
+#           periodSeconds: 60
 ---
-# EXP-13：PDB——自愿中断（维护驱逐）时保证可用副本下限；不阻止硬故障与直接删除。
+# EXP-13/14：PDB——自愿中断（维护驱逐）时保证可用副本下限；不阻止硬故障与直接删除。
+# EXP-14 调整：3 副本下 minAvailable 1→2（允许 1 个自愿中断，EXP-13 为 1 副本时代保守值）。
+# EXP-16 HA 档：order-api 3→2 副本（资源让位 mysql-ic），minAvailable 回落 1。
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

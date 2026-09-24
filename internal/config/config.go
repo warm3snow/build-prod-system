@@ -43,7 +43,12 @@ type Config struct {
 	KafkaBrokers    string // 逗号分隔的 Kafka broker 列表
 	KafkaTopic      string // 订单事件主题
 	KafkaPartitions int    // 主题分区数（EXP-10 冻结 3；分区只增不减）
-	ConsumerGroup   string // 消费组 ID
+	// EXP-17：主题副本数与 min.insync.replicas（HA 档 3/2；单 Broker 档 1/0）。
+	// 语义：RF=3 + minISR=2 + 生产 acks=all = 1 副本故障仍可写、2 副本故障明确
+	// 拒写（NotEnoughReplicas），不产生「写入成功但未持久化」的假成功。
+	KafkaRF     int // 主题复制因子（0 = 不显式设置，走 broker 默认）
+	KafkaMinISR int // min.insync.replicas（0 = 不显式设置）
+	ConsumerGroup string // 消费组 ID
 
 	// outbox-relay
 	RelayBatchSize      int           // 每轮投递批次大小
@@ -86,6 +91,10 @@ type Config struct {
 	DepIsolation     bool          // 隔离+熔断总开关（对照实验可关闭）
 	DepCBFailThresh  int           // 熔断连续失败阈值
 	DepCBOpenDur     time.Duration // 熔断冷却时长
+
+	// EXP-15 坏版本开关（发布回滚实验）：""=正常；"error"=下单 100% 500。
+	// 仅用于坏版本镜像（exp15-bad），主线镜像必须为空。
+	BadMode string
 }
 
 func Load() Config {
@@ -121,6 +130,8 @@ func Load() Config {
 		KafkaBrokers:    getEnv("KAFKA_BROKERS", "kafka.order-lab.svc.cluster.local:9092"),
 		KafkaTopic:      getEnv("KAFKA_TOPIC", "orders"),
 		KafkaPartitions: getInt("KAFKA_PARTITIONS", 3),
+		KafkaRF:         getInt("KAFKA_RF", 1),
+		KafkaMinISR:     getInt("KAFKA_MIN_ISR", 0),
 		ConsumerGroup:   getEnv("CONSUMER_GROUP", "order-consumer"),
 
 		RelayBatchSize:      getInt("RELAY_BATCH_SIZE", 100),
@@ -154,6 +165,8 @@ func Load() Config {
 		DepIsolation:    getBool("DEP_ISOLATION", true),
 		DepCBFailThresh: getInt("DEP_CB_FAIL_THRESHOLD", 5),
 		DepCBOpenDur:    getDur("DEP_CB_OPEN_DURATION", 10*time.Second),
+
+		BadMode: getEnv("BAD_MODE", ""),
 	}
 }
 

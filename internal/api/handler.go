@@ -25,7 +25,7 @@ type Store interface {
 	Ping(ctx context.Context) error
 	GetProduct(ctx context.Context, sku string) (mysql.Product, error)
 	GetStock(ctx context.Context, sku string) (int, error)
-	CreateOrder(ctx context.Context, userID, sku, idemKey, paramHash string, trace event.TraceContext) (*mysql.CreatedOrder, error)
+	CreateOrder(ctx context.Context, userID, sku, channel, idemKey, paramHash string, trace event.TraceContext) (*mysql.CreatedOrder, error)
 	GetLatestOrder(ctx context.Context, userID string) (*mysql.CreatedOrder, error)
 	GetOrdersByCursor(ctx context.Context, userID string, beforeCreatedAt *time.Time, beforeID *int64, limit int) ([]mysql.CreatedOrder, bool, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
@@ -39,16 +39,17 @@ const traceContextKey = "exp09.trace"
 // adm 承载 EXP-11 准入控制（限流/在途上限/总时间预算），任一防线关闭即跳过。
 // dep 为非关键依赖客户端（EXP-12 商品附加信息）；nil 时 /extra 返回 501。
 type Server struct {
-	store Store
-	cch   *cache.Client
-	log   *slog.Logger
-	bp    *Backpressure
-	adm   *admissionState
-	dep   *resilience.Client
+	store   Store
+	cch     *cache.Client
+	log     *slog.Logger
+	bp      *Backpressure
+	adm     *admissionState
+	dep     *resilience.Client
+	badMode string // EXP-15 坏版本开关：""=正常；"error"=下单 100% 500（可控注入）
 }
 
-func NewServer(store Store, cch *cache.Client, log *slog.Logger, bp *Backpressure, adm Admission, dep *resilience.Client) *Server {
-	return &Server{store: store, cch: cch, log: log, bp: bp, adm: newAdmissionState(adm), dep: dep}
+func NewServer(store Store, cch *cache.Client, log *slog.Logger, bp *Backpressure, adm Admission, dep *resilience.Client, badMode string) *Server {
+	return &Server{store: store, cch: cch, log: log, bp: bp, adm: newAdmissionState(adm), dep: dep, badMode: badMode}
 }
 
 // Routes 返回带日志与指标中间件的 Gin 路由。
@@ -159,9 +160,10 @@ func (s *Server) getStock(c *gin.Context) {
 }
 
 type createOrderReq struct {
-	UserID string `json:"user_id" binding:"required"`
-	SKU    string `json:"sku" binding:"required"`
-	Qty    int    `json:"qty"`
+	UserID  string `json:"user_id" binding:"required"`
+	SKU     string `json:"sku" binding:"required"`
+	Qty     int    `json:"qty"`
+	Channel string `json:"channel"` // EXP-15 expand 列；缺省 "web"，旧客户端兼容
 }
 
 func (s *Server) createOrder(c *gin.Context) {
@@ -181,6 +183,16 @@ func (s *Server) createOrder(c *gin.Context) {
 	}
 	paramHash := hashParams(req.UserID, req.SKU, req.Qty)
 
+	// EXP-15 坏版本注入：BAD_MODE=error 时下单 100% 500。
+	// 注入点在所有准入检查之后、事务之前——坏版本不写任何数据（不扣库存、
+	// 不建订单、不写 Outbox），回滚后客户端按原幂等键重试即成功，无脏数据。
+	if s.badMode != "" {
+		RecordBadRelease()
+		writeErr(c, http.StatusInternalServerError, "bad_release",
+			"bad release mode injected (EXP-15)")
+		return
+	}
+
 	// EXP-10 积压反压：事件链路积压超过预算水位时拒绝新下单（503 backlog_limited）。
 	// 检查在事务之前、不扣库存；客户端可用原幂等键在水位回落后重试。
 	if s.bp != nil && s.bp.OverLimit() {
@@ -193,7 +205,7 @@ func (s *Server) createOrder(c *gin.Context) {
 	// 关联上下文：request_id（中间件生成）+ traceparent（W3C，预留 OTel），
 	// 随事件贯穿 Outbox → Kafka → Consumer，实现 HTTP/Relay/Consumer 全链路关联。
 	trace := traceFromContext(c)
-	o, err := s.store.CreateOrder(c.Request.Context(), req.UserID, req.SKU, key, paramHash, trace)
+	o, err := s.store.CreateOrder(c.Request.Context(), req.UserID, req.SKU, req.Channel, key, paramHash, trace)
 	if err != nil {
 		handleStoreErr(c, err)
 		return

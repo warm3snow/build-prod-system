@@ -1,0 +1,151 @@
+# EXP-16 修复：mysql-router 直接运行（绕过 entrypoint 的启动期 bootstrap）。
+#
+# 背景（F2c 实测根因）：
+#   - mysql/mysql-router:8.0 的 /run.sh 在每次容器启动时对 MYSQL_HOST（固定成员）
+#     做「是否 ONLINE 成员」检查并重新 bootstrap；该成员死亡/未重入时 bootstrap
+#     失败 → CrashLoop；F2c 中被杀主库恰是 MYSQL_HOST（ic-0）→ Router 停止监听
+#     → 写恢复被拖到 T+77s（GR 本身 0.6s 完成切主）。
+#
+# 修复：
+#   - bootstrap 产物（conf/keyring/密钥/state/证书）一次性生成后烘焙进
+#     Secret（deploy/k8s/ha/mysql-router-secret.yaml）+ ConfigMap（conf 模板），
+#     initContainer 组装到 /tmp/mysqlrouter；
+#   - 主容器直接 exec mysqlrouter --config（run.sh 走 else 分支，跳过检查）；
+#   - 运行期 metadata cache（ttl=0.5s）在成员死亡时自动切换到幸存者。
+#   - 注意：state.json 的 cluster-metadata-servers 是引导起点；运行期 Router
+#     会自行更新。重新生成 bundle 的方法见 EXP-16-manual。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-router-config
+  namespace: order-lab
+data:
+  # 与一次性 bootstrap 生成的 mysqlrouter.conf 一致（仅保留必要段）。
+  mysqlrouter.conf: |
+    [DEFAULT]
+    logging_folder=
+    runtime_folder=/tmp/mysqlrouter/run
+    data_folder=/tmp/mysqlrouter/data
+    keyring_path=/tmp/mysqlrouter/data/keyring
+    master_key_path=/tmp/mysqlrouter/mysqlrouter.key
+    connect_timeout=5
+    read_timeout=30
+    dynamic_state=/tmp/mysqlrouter/data/state.json
+    client_ssl_cert=/tmp/mysqlrouter/data/router-cert.pem
+    client_ssl_key=/tmp/mysqlrouter/data/router-key.pem
+    client_ssl_mode=PREFERRED
+    server_ssl_mode=AS_CLIENT
+    server_ssl_verify=DISABLED
+    unknown_config_option=error
+
+    [logger]
+    level=INFO
+
+    [metadata_cache:bootstrap]
+    cluster_type=gr
+    router_id=13
+    user=root
+    metadata_cluster=ordercluster
+    ttl=0.5
+    auth_cache_ttl=-1
+    auth_cache_refresh_interval=2
+    use_gr_notifications=0
+
+    [routing:bootstrap_rw]
+    bind_address=0.0.0.0
+    bind_port=6446
+    destinations=metadata-cache://ordercluster/?role=PRIMARY
+    routing_strategy=first-available
+    protocol=classic
+
+    [routing:bootstrap_ro]
+    bind_address=0.0.0.0
+    bind_port=6447
+    destinations=metadata-cache://ordercluster/?role=SECONDARY
+    routing_strategy=round-robin-with-fallback
+    protocol=classic
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-router
+  namespace: order-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: mysql-router}
+  template:
+    metadata:
+      labels: {app: mysql-router}
+    spec:
+      initContainers:
+        # 组装 bootstrap 产物（Secret + ConfigMap → 可写 emptyDir）
+        - name: seed
+          image: mysql/mysql-router:8.0
+          command: ["bash", "-c"]
+          args:
+            - |
+              mkdir -p /tmp/mysqlrouter/data /tmp/mysqlrouter/run /tmp/mysqlrouter/log &&
+              cp /conf/mysqlrouter.conf /tmp/mysqlrouter/ &&
+              cp /secrets/mysqlrouter.key /tmp/mysqlrouter/ &&
+              cp /secrets/keyring /tmp/mysqlrouter/data/ &&
+              cp /secrets/state.json /tmp/mysqlrouter/data/ &&
+              cp /secrets/router-cert.pem /secrets/router-key.pem /secrets/ca.pem /tmp/mysqlrouter/data/ &&
+              chmod 600 /tmp/mysqlrouter/mysqlrouter.key /tmp/mysqlrouter/data/keyring
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+            - name: secrets
+              mountPath: /secrets
+            - name: bundle
+              mountPath: /tmp/mysqlrouter
+      containers:
+        - name: router
+          image: mysql/mysql-router:8.0
+          # 直接运行：$1 != "mysqlrouter" → run.sh 走 else 分支 exec "$@"，
+          # 跳过启动期 bootstrap 检查（该检查依赖固定 MYSQL_HOST，是 F2c 的
+          # 写恢复被拖到 T+77s 的根因）。
+          command: ["/usr/bin/mysqlrouter", "--config", "/tmp/mysqlrouter/mysqlrouter.conf"]
+          ports:
+            - {containerPort: 6446, name: rw}
+            - {containerPort: 6447, name: ro}
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6446"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6446"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+          resources:
+            # qemu 修正：amd64 镜像经 binfmt 模拟（~8 倍 CPU 开销）。
+            # 实测 250m limit 下 100 rps 即 100% 节流；2 核支撑 ~600 rps 代理。
+            # 网络恢复后应换原生 arm64 镜像并回调。
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: "2", memory: 256Mi}
+          volumeMounts:
+            - name: bundle
+              mountPath: /tmp/mysqlrouter
+      volumes:
+        - name: conf
+          configMap:
+            name: mysql-router-config
+        - name: secrets
+          secret:
+            secretName: mysql-router-secrets
+        - name: bundle
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-router
+  namespace: order-lab
+spec:
+  selector: {app: mysql-router}
+  ports:
+    - {port: 6446, targetPort: 6446, name: rw}
+    - {port: 6447, targetPort: 6447, name: ro}

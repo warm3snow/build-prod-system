@@ -48,7 +48,10 @@ type OrderModel struct {
 	Qty            int               `gorm:"column:qty;not null" json:"qty"`
 	UnitPriceCents int64             `gorm:"column:unit_price_cents;not null" json:"unit_price_cents"`
 	Status         order.OrderStatus `gorm:"column:status;not null;size:16" json:"status"`
-	CreatedAt      time.Time         `gorm:"column:created_at;not null;index:idx_orders_user_created,priority:2" json:"-"`
+	// EXP-15 Schema expand：新列有默认值，旧版本代码的 INSERT 不含该列仍可写。
+	// 收缩（DROP/改约束）必须与发布分离，不能与旧版本共存期间执行。
+	Channel   string    `gorm:"column:channel;not null;size:32;default:web" json:"channel"`
+	CreatedAt time.Time `gorm:"column:created_at;not null;index:idx_orders_user_created,priority:2" json:"-"`
 }
 
 func (OrderModel) TableName() string { return "orders" }
@@ -143,6 +146,7 @@ type CreatedOrder struct {
 	Qty            int       `json:"qty"`
 	UnitPriceCents int64     `json:"unit_price_cents"`
 	Status         string    `json:"status"`
+	Channel        string    `json:"channel"`
 	CreatedAt      time.Time `json:"created_at"`
 	Replayed       bool      `json:"replayed"`
 }
@@ -153,7 +157,11 @@ type CreatedOrder struct {
 // 死锁（1213）与锁等待（1205）通过有限重试自动恢复。
 // EXP-09：新订单在事务内写入 Outbox（事件 ID 唯一），重放订单不产生新事件；
 // trace 携带关联上下文（request_id/trace_parent），贯穿 Relayer 与 Consumer。
-func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, paramHash string, trace event.TraceContext) (*CreatedOrder, error) {
+// EXP-15：channel 为 expand 列（默认 "web"），旧版本客户端不传时走默认值。
+func (s *Store) CreateOrder(ctx context.Context, userID, sku, channel string, idemKey, paramHash string, trace event.TraceContext) (*CreatedOrder, error) {
+	if channel == "" {
+		channel = "web"
+	}
 	var out *CreatedOrder
 	err := withTxRetry(ctx, s.db, func(tx *gorm.DB) error {
 		// 1. 幂等占位（含参数哈希）：同键第二次插入触发 1062，判定重放或冲突。
@@ -199,6 +207,7 @@ func (s *Store) CreateOrder(ctx context.Context, userID, sku string, idemKey, pa
 			Qty:            1,
 			UnitPriceCents: p.PriceCents,
 			Status:         order.StatusCreated,
+			Channel:        channel,
 		}
 		if err := tx.Create(&o).Error; err != nil {
 			return fmt.Errorf("insert order: %w", err)
@@ -356,6 +365,7 @@ func toCreatedOrder(o OrderModel, replayed bool) *CreatedOrder {
 		Qty:            o.Qty,
 		UnitPriceCents: o.UnitPriceCents,
 		Status:         string(o.Status),
+		Channel:        o.Channel,
 		CreatedAt:      o.CreatedAt,
 		Replayed:       replayed,
 	}

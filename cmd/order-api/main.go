@@ -146,7 +146,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         cfg.HTTPAddr,
-		Handler:      api.NewServer(store, cch, log, bp, adm, dep).Routes(),
+		Handler:      api.NewServer(store, cch, log, bp, adm, dep, cfg.BadMode).Routes(),
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 	}

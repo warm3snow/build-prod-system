@@ -62,7 +62,7 @@ func main() {
 	// Kafka 稍后可用自动衔接投递；期间 Outbox 事件保持 PENDING 积压。
 	var prod *kafka.Producer
 	for {
-		prod, err = kafka.NewProducer(strings.Split(cfg.KafkaBrokers, ","), cfg.KafkaTopic, cfg.KafkaPartitions)
+		prod, err = kafka.NewProducer(strings.Split(cfg.KafkaBrokers, ","), cfg.KafkaTopic, cfg.KafkaPartitions, cfg.KafkaRF, cfg.KafkaMinISR)
 		if err == nil {
 			break
 		}

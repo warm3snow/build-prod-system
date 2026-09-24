@@ -77,3 +77,24 @@
 | HPA（EXP-13 冻结） | CPU 70% × requests=1 核、min 1 / max 5（连接预算 25N+20 ≤ 151）；缩容 60s 稳定 + 50%/60s | EXP-13 |
 | 扩容时序 | 指标可用 ~15s → rescale 一步 1→5 → 全 Ready 60-90s；缩容 5→2→1 每步 ~75s | EXP-13 |
 | 缩容稳定性 | 3→1 负载中 97.2% 通过、~2.5s 摘除窗口、0 订单丢失 | EXP-13 |
+| 应用故障域（EXP-14 冻结） | 固定 3 副本、maxSurge 0/maxUnavailable 1、PDB minAvailable 2、HPA 停用 | EXP-14 |
+| 三类中断失败率 | 优雅退出 0.002%（2/96000）、突然中断 0.01%（14/96001）、容器崩溃 0.04%（44/96001），1:1:1 全程成立 | EXP-14 |
+| PDB 驱逐语义 | minAvailable 2：第 1 次驱逐 201、第 2 次 429、恢复后自动放行 | EXP-14 |
+| 节点故障结论 | 单机 cordon/drain = 全停（模拟档）；节点级 HA 推迟到多节点档 | EXP-14 |
+| 发布（EXP-15 冻结） | 滚动 maxSurge 0/maxUnavailable 1；门禁=5xx 率 >1% 自动 undo；Schema 只做 expand（新列带默认值），contract 与发布分离 | EXP-15 |
+| 正常发布窗口失败率 | 0.39%（connection refused，服务端不可见）；rollout ~60s | EXP-15 |
+| 坏版本识别与回滚 | 识别 ~85s（错误率 3.74%）、回滚 14s；0 脏数据；undo 只回退一个 revision | EXP-15 |
+| Schema 兼容 | expand：旧代码读写正常（DEFAULT 'web'）；contract 反例：DROP COLUMN → 新代码 1054 | EXP-15 |
+| 发布流程 | tests/release.sh：smoke→回归→发布→SLO 检查→自动回滚，exit=0 一次通过 | EXP-15 |
+| MySQL HA（EXP-16 冻结） | InnoDB Cluster 单主 ×3 + Router ×2 直接运行（烘焙配置）；BEFORE_ON_PRIMARY_FAILOVER + unreachable_majority_timeout=5 + exitStateAction=READ_ONLY；成员 1 核/1.5Gi limit（故障态预算）；探针 150s 容忍 | EXP-16 |
+| HA 档基线 | 600 rps（读 p99 77ms / 写 p99 337ms / 失败 0.001%）；缩尺自 qemu Router（~8×CPU），非 MySQL 集群瓶颈 | EXP-16 |
+| 主库切换 RTO | GR 选举 0.6s；客户端写恢复 ~30s（Router 刷新+连接池替换）；总失败 3.01%（600 rps×300s 强杀主库） | EXP-16 |
+| 切换数据完整性 | 0 已提交订单丢失（kill 前最后订单新主可读）；1:1:1=45059 全程含 3 次切主+全灭恢复 | EXP-16 |
+| 多数派行为 | 默认 timeout=0 时少数派主库继续写（RPO 风险，实测反例）；timeout=5+暴亡 → T+21s super_read_only=1 明确拒写 | EXP-16 |
+| Router 修复 | entrypoint 自引导（MYSQL_HOST 单点）→ 直接运行烘焙配置：写恢复 77s→30s、失败 51.6%→3.01% | EXP-16 |
+| GORM GR 兼容 | OnConflict{DoNothing}→ON DUPLICATE KEY UPDATE id=id 在 GR 上 Error 1869（单实例无）；副作用表统一 INSERT IGNORE（ADR-034） | EXP-16 |
+| Kafka HA（EXP-17 冻结） | KRaft combined ×3（Parallel + publishNotReadyAddresses）；topic orders RF=3/min.isr=2 显式；relay acks=all；旧单 Broker 退役（PVC 存档） | EXP-17 |
+| 事件链路 HA 基线 | 600 rps：投递 p99 1.29s、完成 p99 1.34s（SLO 5s ✓）、1:1:1、lag=0 | EXP-17 |
+| Leader 强杀 | T+20s 内分区/Controller Leader 双切换；PENDING ≤15 瞬时；下单零影响；对账 66506 全绿 | EXP-17 |
+| 双杀（多数派失守） | NotEnoughReplicas 明确拒写 + Coordinator 不可用（元数据停摆）；PENDING 瞬时 658 → T+37s 排空；终局 76713 四表 1:1:1 | EXP-17 |
+| K8s 多清单纪律 | 同名 Service 会被 apply 相互覆写 selector（EXP-17 实测全集群 DNS 失效）；退役组件清单定义必须同步删除（ADR-037） | EXP-17 |

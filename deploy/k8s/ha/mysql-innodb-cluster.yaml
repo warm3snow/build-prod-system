@@ -1,0 +1,126 @@
+# EXP-16 HA 档：MySQL InnoDB Cluster 单主模式 + Router。
+# 结构：ConfigMap（mysqld 基础配置）→ Headless Service → StatefulSet mysql-ic × 3
+#       （独立 PVC）→ mysql-router × 2（bootstrap initContainer）→ Service。
+#
+# 关键设计（EXP-16 踩坑修正）：
+#   - group_replication_* 变量不能出现在命令行/配置文件：mysql:8.0 entrypoint 的
+#     --initialize 阶段不认识插件变量（unknown variable → init 中断 → 半成品字典
+#     → 后续重启全部跳过 init → privilege tables 崩溃循环）；
+#   - 因此：命令行/ConfigMap 只放标准变量（server-id/report-host/gtid 等），
+#     插件用 plugin_load_add 预加载（可在 --initialize 阶段安全读取），
+#     GR 变量由 mysqlsh dba.createCluster/addInstance 通过 SET PERSIST 写入
+#     mysqld-auto.cnf（重启自动生效）；
+#   - 引导用宿主机 mysqlsh 8.0.41（port-forward），见 EXP-16-manual。
+#
+# 资源预算（HA 档，单机 6 核/16GB）：
+#   order-api 3→2 副本（-1 核）；单实例 mysql 退役（scale 0，PVC 保留）；
+#   mysql-ic 3 × (250m req / 1 核 limit；256Mi req / 768Mi limit)；
+#   router 2 × (50m / 128Mi)。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-ic-config
+  namespace: order-lab
+data:
+  gr.cnf: |
+    [mysqld]
+    plugin_load_add=group_replication.so
+    gtid_mode=ON
+    enforce_gtid_consistency=ON
+    binlog_checksum=NONE
+    innodb_buffer_pool_size=128M
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-ic-hs
+  namespace: order-lab
+spec:
+  clusterIP: None
+  selector: {app: mysql-ic}
+  ports:
+    - {port: 3306, targetPort: 3306, name: mysql}
+    - {port: 33061, targetPort: 33061, name: gr}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-ic
+  namespace: order-lab
+spec:
+  serviceName: mysql-ic-hs
+  replicas: 3
+  selector:
+    matchLabels: {app: mysql-ic}
+  template:
+    metadata:
+      labels: {app: mysql-ic}
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_ROOT_PASSWORD}}
+            - name: MYSQL_DATABASE
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_DATABASE}}
+            - name: MYSQL_USER
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_USER}}
+            - name: MYSQL_PASSWORD
+              valueFrom: {secretKeyRef: {name: mysql-secret, key: MYSQL_PASSWORD}}
+          # 只传标准变量：server-id 按序号唯一、report-host 供 addInstance/克隆使用。
+          # GR 变量（group_name/local_address/seeds/consistency 等）由 mysqlsh
+          # 引导时 SET PERSIST（见 manual），持久化在 mysqld-auto.cnf。
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              exec /usr/local/bin/docker-entrypoint.sh mysqld \
+                --server-id=$(( ${HOSTNAME##*-} + 1 )) \
+                --report-host=${HOSTNAME}.mysql-ic-hs.order-lab.svc.cluster.local
+          ports:
+            - {containerPort: 3306, name: mysql}
+            - {containerPort: 33061, name: gr}
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h 127.0.0.1 -uflash -pflash"]
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            # EXP-16 实测修正：5s 超时在高负载（qemu Router + GR 认证 + 回源风暴）
+            # 下周期性误杀 mysqld（RESTARTS 3-4 次），被 GR 驱逐后引发非计划切主、
+            # 乃至多数派失守。存活判定放宽到 150s 容忍（30s×5 次失败、10s 超时）——
+            # 数据库存活探针必须容忍负载尖峰（EXP-02/EXP-10 同款教训）。
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h 127.0.0.1 -uflash -pflash"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests: {cpu: 250m, memory: 256Mi}
+            # EXP-16 实测修正：768Mi limit 下切主瞬间 OOMKilled（Exit 137）——
+            # 新主承接全部写流量 + 积压事务应用 + GR certification，内存冲破上限
+            # → 新主被杀 → 多数派失守 → 全 OFFLINE（F2b 实测）。
+            # 「故障态内存预算 ≠ 正常态」：limit 提至 1.5Gi（节点实际占用仅 53%），
+            # requests 保持 256Mi（调度口径不变）。
+            limits: {cpu: "1", memory: 1536Mi}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: config
+              mountPath: /etc/mysql/conf.d
+      volumes:
+        - name: config
+          configMap:
+            name: mysql-ic-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

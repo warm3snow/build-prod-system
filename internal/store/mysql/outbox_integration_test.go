@@ -21,7 +21,7 @@ func TestOutboxWrittenWithOrder(t *testing.T) {
 	ctx := context.Background()
 	trace := event.TraceContext{RequestID: "rid-test", TraceParent: "00-abc-def-01"}
 
-	o, err := store.CreateOrder(ctx, userID, sku, "obx-key", hashFor(userID, sku), trace)
+	o, err := store.CreateOrder(ctx, userID, sku, "", "obx-key", hashFor(userID, sku), trace)
 	if err != nil {
 		t.Fatalf("create order: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestOutboxWrittenWithOrder(t *testing.T) {
 	}
 
 	// 同幂等键重放：不产生新订单，也不产生新事件。
-	o2, err := store.CreateOrder(ctx, userID, sku, "obx-key", hashFor(userID, sku), trace)
+	o2, err := store.CreateOrder(ctx, userID, sku, "", "obx-key", hashFor(userID, sku), trace)
 	if err != nil {
 		t.Fatalf("replay order: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestOutboxStateMachine(t *testing.T) {
 	resetSku(t, db, "P1", 5, userID)
 
 	ctx := context.Background()
-	o, err := store.CreateOrder(ctx, userID, "P1", "sm-key", hashFor(userID, "P1"), event.TraceContext{})
+	o, err := store.CreateOrder(ctx, userID, "P1", "", "sm-key", hashFor(userID, "P1"), event.TraceContext{})
 	if err != nil {
 		t.Fatalf("create order: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestOutboxStateMachine(t *testing.T) {
 	}
 
 	// DEAD 状态机：另建事件，尝试耗尽
-	o2, err := store.CreateOrder(ctx, userID, "P1", "sm-key-2", hashFor(userID, "P1"), event.TraceContext{})
+	o2, err := store.CreateOrder(ctx, userID, "P1", "", "sm-key-2", hashFor(userID, "P1"), event.TraceContext{})
 	if err != nil {
 		t.Fatalf("create order 2: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestOutboxPerOrderReconcile(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 10; i++ {
-		if _, err := store.CreateOrder(ctx, userID, sku, "rc-key-"+string(rune('a'+i)), hashFor(userID, sku), event.TraceContext{}); err != nil {
+		if _, err := store.CreateOrder(ctx, userID, sku, "", "rc-key-"+string(rune('a'+i)), hashFor(userID, sku), event.TraceContext{}); err != nil {
 			t.Fatalf("create order %d: %v", i, err)
 		}
 	}
